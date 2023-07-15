@@ -22,6 +22,7 @@
 #include <linux/sched.h>
 #include <linux/module.h>
 #include <linux/list.h>
+#include <linux/arch_topology.h>
 #include <linux/hash.h>
 #include <linux/msm_ion.h>
 #include <linux/qcom_scm.h>
@@ -54,6 +55,7 @@
 #include <linux/iommu.h>
 #include <asm/arch_timer.h>
 #include <linux/genalloc.h>
+#include <soc/qcom/socinfo.h>
 
 #ifdef CONFIG_HIBERNATION
 #include <linux/suspend.h>
@@ -104,9 +106,6 @@
 #define M_KERNEL_PERF_LIST (PERF_KEY_MAX)
 #define M_DSP_PERF_LIST (12)
 
-#define SESSION_ID_INDEX (30)
-#define SESSION_ID_MASK (1 << SESSION_ID_INDEX)
-#define PROCESS_ID_MASK ((2^SESSION_ID_INDEX) - 1)
 #define FASTRPC_CTX_MAGIC (0xbeeddeed)
 
 /* Process status notifications from DSP will be sent with this unique context */
@@ -139,6 +138,10 @@
 #define IS_CACHE_ALIGNED(x) (((x) & ((L1_CACHE_BYTES)-1)) == 0)
 #ifndef ION_FLAG_CACHED
 #define ION_FLAG_CACHED (1)
+#endif
+
+#ifndef topology_cluster_id
+#define topology_cluster_id(cpu) topology_physical_package_id(cpu)
 #endif
 
 /*
@@ -197,6 +200,9 @@
 /* Max no. of persistent headers pre-allocated per process */
 #define MAX_PERSISTENT_HEADERS    (25)
 
+/* Max value of unique fastrpc tgid */
+#define MAX_FRPC_TGID 65
+
 #define PERF_CAPABILITY_SUPPORT	(1 << 1)
 #define KERNEL_ERROR_CODE_V1_SUPPORT	1
 #define USERSPACE_ALLOCATION_SUPPORT	1
@@ -222,6 +228,9 @@
 
 /* Unique index flag used for mini dump */
 static int md_unique_index_flag[MAX_UNIQUE_ID] = { 0, 0, 0, 0, 0 };
+
+/* Array to keep track unique tgid_frpc usage */
+static bool frpc_tgid_usage_array[NUM_CHANNELS][MAX_FRPC_TGID] = {0};
 
 /* Fastrpc remote process attributes */
 enum fastrpc_proc_attr {
@@ -957,6 +966,8 @@ static int fastrpc_mmap_remove(struct fastrpc_file *fl, int fd, uintptr_t va,
 		if ((fd < 0 || map->fd == fd) && map->raddr == va &&
 			map->raddr + map->len == va + len &&
 			map->refs == 1 &&
+			/* Remove map only if it isn't being used in any pending RPC calls */
+			!map->ctx_refs &&
 			/* Skip unmap if it is fastrpc shell memory */
 			!map->is_filemap) {
 			match = map;
@@ -997,7 +1008,7 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 				map->flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 		spin_lock_irqsave(&me->hlock, irq_flags);
 		map->refs--;
-		if (!map->refs && !map->is_persistent)
+		if (!map->refs && !map->is_persistent && !map->ctx_refs)
 			hlist_del_init(&map->hn);
 		spin_unlock_irqrestore(&me->hlock, irq_flags);
 		if (map->refs > 0) {
@@ -1012,7 +1023,7 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 		spin_unlock_irqrestore(&me->hlock, irq_flags);
 	} else {
 		map->refs--;
-		if (!map->refs)
+		if (!map->refs && !map->ctx_refs)
 			hlist_del_init(&map->hn);
 		if (map->refs > 0 && !flags)
 			return;
@@ -1828,6 +1839,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 	}
 	ctx->retval = -1;
 	ctx->pid = current->pid;
+	/* Store HLOS PID in context, it is not being sent to DSP */
 	ctx->tgid = fl->tgid;
 	init_completion(&ctx->work);
 	ctx->magic = FASTRPC_CTX_MAGIC;
@@ -1846,6 +1858,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 			goto bail;
 		}
 		memset(ctx->perf, 0, sizeof(*(ctx->perf)));
+		/* Use HLOS PID, as perf tid is not being sent to DSP and is used to log in traces */
 		ctx->perf->tid = fl->tgid;
 	}
 	if (invokefd->job) {
@@ -1953,8 +1966,15 @@ static void context_free(struct smq_invoke_ctx *ctx)
 	spin_unlock(&ctx->fl->hlock);
 
 	mutex_lock(&ctx->fl->map_mutex);
-	for (i = 0; i < nbufs; ++i)
+	for (i = 0; i < nbufs; ++i) {
+		/*
+		 * Decrement ctx refs count before mmap free,
+		 * indicate remote call no longer using it
+		 */
+		if (ctx->maps[i] && ctx->maps[i]->ctx_refs)
+			ctx->maps[i]->ctx_refs--;
 		fastrpc_mmap_free(ctx->maps[i], 0);
+	}
 	mutex_unlock(&ctx->fl->map_mutex);
 
 	fastrpc_buf_free(ctx->buf, 1);
@@ -2018,13 +2038,11 @@ static void fastrpc_notif_find_process(int domain, struct smq_notif_rspv3 *notif
 	struct fastrpc_file *fl = NULL;
 	struct hlist_node *n;
 	bool is_process_found = false;
-	int sessionid = 0;
 	unsigned long irq_flags = 0;
 
 	spin_lock_irqsave(&me->hlock, irq_flags);
 	hlist_for_each_entry_safe(fl, n, &me->drivers, hn) {
-		if (fl->tgid == notif->pid ||
-				(fl->tgid == (notif->pid & PROCESS_ID_MASK))) {
+		if (fl->tgid_frpc == notif->pid) {
 			is_process_found = true;
 			break;
 		}
@@ -2033,9 +2051,7 @@ static void fastrpc_notif_find_process(int domain, struct smq_notif_rspv3 *notif
 
 	if (!is_process_found)
 		return;
-	if (notif->pid & SESSION_ID_MASK)
-		sessionid = 1;
-	fastrpc_queue_pd_status(fl, domain, notif->status, sessionid);
+	fastrpc_queue_pd_status(fl, domain, notif->status, fl->sessionid);
 }
 
 static void context_notify_user(struct smq_invoke_ctx *ctx,
@@ -2342,6 +2358,12 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			err = fastrpc_mmap_create(ctx->fl, ctx->fds[i], NULL,
 					ctx->attrs[i], buf, len,
 					mflags, &ctx->maps[i]);
+		 /*
+		  * Increment ctx refs count for in/out buffer if map created,
+		  * indicate map under use in remote call
+		  */
+		if (ctx->maps[i])
+			ctx->maps[i]->ctx_refs++;
 		mutex_unlock(&ctx->fl->map_mutex);
 		if (err)
 			goto bail;
@@ -2369,10 +2391,23 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 					FASTRPC_ATTR_NOVA, 0, 0, dmaflags,
 					&ctx->maps[i]);
 		if (err) {
-			for (j = bufs; j < i; j++)
+			for (j = bufs; j < i; j++) {
+				/*
+				 * Due to error decrement ctx refs count before mmap free
+				 * for each in/out handle, if map created
+				 */
+				if (ctx->maps[j] && ctx->maps[j]->ctx_refs)
+					ctx->maps[j]->ctx_refs--;
 				fastrpc_mmap_free(ctx->maps[j], 0);
+			}
 			mutex_unlock(&ctx->fl->map_mutex);
 			goto bail;
+		} else if (ctx->maps[i]) {
+			/*
+			 * Increment ctx refs count for in/out handle if map created
+			 * and no error, indicate map under use in remote call
+			 */
+			ctx->maps[i]->ctx_refs++;
 		}
 		ipage += 1;
 	}
@@ -2704,6 +2739,12 @@ static int put_args(uint32_t kernel, struct smq_invoke_ctx *ctx,
 			}
 		} else {
 			mutex_lock(&ctx->fl->map_mutex);
+			/*
+			 * Decrement ctx refs count before mmap free,
+			 * indicate remote call no longer using it
+			 */
+			if (ctx->maps[i]->ctx_refs)
+				ctx->maps[i]->ctx_refs--;
 			fastrpc_mmap_free(ctx->maps[i], 0);
 			mutex_unlock(&ctx->fl->map_mutex);
 			ctx->maps[i] = NULL;
@@ -2714,8 +2755,15 @@ static int put_args(uint32_t kernel, struct smq_invoke_ctx *ctx,
 		if (!fdlist[i])
 			break;
 		if (!fastrpc_mmap_find(ctx->fl, (int)fdlist[i], NULL, 0, 0,
-					0, 0, &mmap))
+					0, 0, &mmap)) {
+			/*
+			 * Decrement ctx refs count before mmap free,
+			 * indicate remote call no longer using it
+			 */
+			if (mmap && mmap->ctx_refs)
+				mmap->ctx_refs--;
 			fastrpc_mmap_free(mmap, 0);
+		}
 	}
 	mutex_unlock(&ctx->fl->map_mutex);
 	if (ctx->crc && crclist && rpra)
@@ -2825,6 +2873,7 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 {
 	struct smq_msg *msg = &ctx->msg;
 	struct smq_msg msg_temp;
+	struct smq_invoke_ctx ctx_temp;
 	struct fastrpc_file *fl = ctx->fl;
 	struct fastrpc_channel_ctx *channel_ctx = NULL;
 	int err = 0, cid = -1;
@@ -2832,6 +2881,8 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 	int64_t ns = 0;
 	uint64_t xo_time_in_us = 0;
 	int isasync = (ctx->asyncjob.isasyncjob ? true : false);
+	unsigned long irq_flags = 0;
+	uint32_t index = 0;
 
 	if (!fl) {
 		err = -EBADF;
@@ -2846,10 +2897,9 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 
 	channel_ctx = &fl->apps->channel[cid];
 	mutex_lock(&channel_ctx->smd_mutex);
-	msg->pid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	msg->pid = fl->tgid_frpc;
 	msg->tid = current->pid;
-	if (fl->sessionid)
-		msg->tid |= SESSION_ID_MASK;
 	if (kernel == KERNEL_MSG_WITH_ZERO_PID)
 		msg->pid = 0;
 	msg->invoke.header.ctx = ctx->ctxid | fl->pd;
@@ -2870,16 +2920,27 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 		/*
 		 * After message is sent to DSP, async response thread could immediately
 		 * get the response and free context, which will result in a use-after-free
-		 * in this function. So use a local variable for message.
+		 * in this function. So use a local variable for message and context.
 		 */
 		memcpy(&msg_temp, msg, sizeof(struct smq_msg));
 		msg = &msg_temp;
+		memcpy(&ctx_temp, ctx, sizeof(struct smq_invoke_ctx));
+		index = (uint32_t)GET_TABLE_IDX_FROM_CTXID(ctx->ctxid);
 	}
+
 	err = fastrpc_transport_send(cid, (void *)msg, sizeof(*msg), fl->tvm_remote_domain);
-	if (isasync && !err) {
-		spin_lock(&fl->hlock);
-		ctx->is_job_sent_to_remote_ss = true;
-		spin_unlock(&fl->hlock);
+	if (isasync) {
+		if (!err) {
+			/*
+			 * Validate the ctx as this could have been already
+			 * freed by async response.
+			 */
+			spin_lock_irqsave(&channel_ctx->ctxlock, irq_flags);
+			if (index < FASTRPC_CTX_MAX && channel_ctx->ctxtable[index] == ctx)
+				ctx->is_job_sent_to_remote_ss = true;
+			spin_unlock_irqrestore(&channel_ctx->ctxlock, irq_flags);
+		}
+		ctx = &ctx_temp;
 	}
 	trace_fastrpc_transport_send(cid, (uint64_t)ctx, msg->invoke.header.ctx,
 		handle, sc, msg->invoke.page.addr, msg->invoke.page.size);
@@ -2889,34 +2950,42 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 	return err;
 }
 
-/*
- * fastrpc_get_dsp_status - Reads the property string from device node
- *                          and updates the cdsp device avialbility status
- *                          if the node belongs to cdsp device.
+/* fastrpc_get_nsp_status() - Reads the property string from soc_info
+ * denoted for nsp part, and updates the nsp device avialbility status
+ * if the nsp is not defective.
  * @me  : pointer to fastrpc_apps.
  */
 
-static void fastrpc_get_dsp_status(struct fastrpc_apps *me)
+static void fastrpc_get_nsp_status(struct fastrpc_apps *me)
 {
-	int ret = -1;
-	struct device_node *node = NULL;
-	const char *name = NULL;
+	if (socinfo_get_part_info(PART_NSP)) {
+		me->fastrpc_nsp_status = 0;
+		ADSPRPC_ERR(
+			"nsp part defective with status:%x\n", me->fastrpc_nsp_status);
+	} else {
+		me->fastrpc_nsp_status = 1;
+		ADSPRPC_INFO("nsp available with status: %x\n", me->fastrpc_nsp_status);
+	}
+}
 
-	do {
-		node = of_find_compatible_node(node, NULL, "qcom,pil-tz-generic");
-		if (node) {
-			ret = of_property_read_string(node, "qcom,firmware-name", &name);
-			if (!strcmp(name, "cdsp")) {
-				ret =  of_device_is_available(node);
-				me->remote_cdsp_status = ret;
-				ADSPRPC_INFO("cdsp node found with ret:%x\n", ret);
-				break;
-			}
-		} else {
-			ADSPRPC_ERR("cdsp node not found\n");
-			break;
-		}
-	} while (1);
+/*
+ * Counts number of cores corresponding
+ * to cluster id 0. If a core is defective or unavailable, skip counting
+ * that core.
+ * @me : pointer to fastrpc_apps.
+ */
+
+static void fastrpc_lowest_capacity_corecount(struct fastrpc_apps *me)
+{
+	unsigned int cpu = 0;
+
+	cpu =  cpumask_first(cpu_possible_mask);
+	for_each_cpu(cpu, cpu_possible_mask) {
+		if (topology_cluster_id(cpu) == 0)
+			me->lowest_capacity_core_count++;
+	}
+	ADSPRPC_INFO("lowest capacity core count: %u\n",
+					me->lowest_capacity_core_count);
 }
 
 static void fastrpc_init(struct fastrpc_apps *me)
@@ -2928,6 +2997,7 @@ static void fastrpc_init(struct fastrpc_apps *me)
 	spin_lock_init(&me->hlock);
 	me->channel = &gcinfo[0];
 	mutex_init(&me->mut_uid);
+	me->max_sess_per_proc = DEFAULT_MAX_SESS_PER_PROC;
 	for (i = 0; i < NUM_CHANNELS; i++) {
 		init_completion(&me->channel[i].work);
 		init_completion(&me->channel[i].workport);
@@ -3294,9 +3364,11 @@ int fastrpc_internal_invoke(struct fastrpc_file *fl, uint32_t mode,
 		context_free(ctx);
 		trace_fastrpc_msg("context_free: end");
 	}
-	if (VALID_FASTRPC_CID(cid)
-		&& (fl->ssrcount != fl->apps->channel[cid].ssrcount))
-		err = -ECONNRESET;
+	if (!kernel) {
+		if (VALID_FASTRPC_CID(cid)
+			&& (fl->ssrcount != fl->apps->channel[cid].ssrcount))
+			err = -ECONNRESET;
+	}
 
 invoke_end:
 	if (fl->profile && !interrupted && isasyncinvoke)
@@ -3507,6 +3579,16 @@ static int fastrpc_set_session_info(
 	// Processes attaching to Sensor Static PD, share context bank.
 	if (sess_info->pd_type == SENSORS_STATICPD)
 		fl->sharedcb = 1;
+	if (sess_info->session_id >= me->max_sess_per_proc) {
+		ADSPRPC_ERR(
+		"Session ID %u cannot be beyond %u\n",
+				sess_info->session_id, me->max_sess_per_proc);
+		err = -EBADR;
+		goto bail;
+	}
+	fl->sessionid = sess_info->session_id;
+	// Set multi_session_support, to disable old way of setting session_id
+	fl->multi_session_support = true;
 	VERIFY(err, 0 == (err = fastrpc_get_info(fl, &(sess_info->domain_id))));
 	if (err)
 		goto bail;
@@ -3757,7 +3839,7 @@ static int fastrpc_mmap_remove_ssr(struct fastrpc_file *fl, int locked);
 static int fastrpc_init_attach_process(struct fastrpc_file *fl,
 					struct fastrpc_ioctl_init *init)
 {
-	int err = 0, tgid = fl->tgid;
+	int err = 0, tgid = fl->tgid_frpc;
 	remote_arg_t ra[1];
 	struct fastrpc_ioctl_invoke_async ioctl;
 
@@ -3770,6 +3852,7 @@ static int fastrpc_init_attach_process(struct fastrpc_file *fl,
 	/*
 	 * Prepare remote arguments for creating thread group
 	 * in guestOS/staticPD on the remote subsystem.
+	 * Send unique fastrpc id to dsp
 	 */
 	ra[0].buf.pv = (void *)&tgid;
 	ra[0].buf.len = sizeof(tgid);
@@ -3853,7 +3936,7 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 
 	spin_unlock(&fl->hlock);
 
-	inbuf.pgid = fl->tgid;
+	inbuf.pgid = fl->tgid_frpc;
 	inbuf.namelen = strlen(current->comm) + 1;
 	inbuf.filelen = init->filelen;
 	fl->pd = FASTRPC_USER_PD;
@@ -4114,7 +4197,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_file *fl,
 	}
 
 	fl->pd = FASTRPC_USER_PD;
-	inbuf.pgid = fl->tgid;
+	inbuf.pgid = fl->tgid_frpc;
 	inbuf.namelen = init->filelen;
 	inbuf.pageslen = 0;
 
@@ -4554,7 +4637,8 @@ static int fastrpc_release_current_dsp_process(struct fastrpc_file *fl)
 		err = -ECONNRESET;
 		goto bail;
 	}
-	tgid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	tgid = fl->tgid_frpc;
 	ra[0].buf.pv = (void *)&tgid;
 	ra[0].buf.len = sizeof(tgid);
 	ioctl.inv.handle = FASTRPC_STATIC_HANDLE_PROCESS_GROUP;
@@ -4613,7 +4697,8 @@ static int fastrpc_mem_map_to_dsp(struct fastrpc_file *fl, int fd, int offset,
 		uint64_t vaddrout;
 	} routargs;
 
-	inargs.pid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	inargs.pid = fl->tgid_frpc;
 	inargs.fd = fd;
 	inargs.offset = offset;
 	inargs.vaddrin = (uintptr_t)va;
@@ -4664,7 +4749,8 @@ static int fastrpc_mem_unmap_to_dsp(struct fastrpc_file *fl, int fd,
 		uint64_t len;
 	} inargs;
 
-	inargs.pid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	inargs.pid = fl->tgid_frpc;
 	inargs.fd = fd;
 	inargs.vaddrin = (uint64_t)va;
 	inargs.len = (uint64_t)size;
@@ -4700,7 +4786,8 @@ static int fastrpc_unmap_on_dsp(struct fastrpc_file *fl,
 		size_t size;
 	} inargs;
 
-	inargs.pid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	inargs.pid = fl->tgid_frpc;
 	inargs.size = size;
 	inargs.vaddrout = raddr;
 	ra[0].buf.pv = (void *)&inargs;
@@ -4752,7 +4839,8 @@ static int fastrpc_mmap_on_dsp(struct fastrpc_file *fl, uint32_t flags,
 		goto bail;
 	}
 	cid = fl->cid;
-	inargs.pid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	inargs.pid = fl->tgid_frpc;
 	inargs.vaddrin = (uintptr_t)va;
 	inargs.flags = flags;
 	inargs.num = fl->apps->compat ? num * sizeof(page) : num;
@@ -4857,7 +4945,8 @@ static int fastrpc_munmap_on_dsp_rh(struct fastrpc_file *fl, uint64_t phys,
 		goto bail;
 	}
 
-	tgid = fl->tgid;
+	/* Send unique fastrpc process ID to dsp */
+	tgid = fl->tgid_frpc;
 	ra[0].buf.pv = (void *)&tgid;
 	ra[0].buf.len = sizeof(tgid);
 	ra[1].buf.pv = (void *)&routargs;
@@ -5497,7 +5586,8 @@ static void handle_remote_signal(uint64_t msg, int cid)
 
 	spin_lock_irqsave(&me->hlock, irq_flags);
 	hlist_for_each_entry_safe(fl, n, &me->drivers, hn) {
-		if ((fl->tgid == pid) && (fl->cid == cid)) {
+		/* Response from DSP contains unique fastrpc process id, use unique fastrpc process ID to compare */
+		if ((fl->tgid_frpc == pid) && (fl->cid == cid)) {
 			unsigned long fflags = 0;
 
 			spin_lock_irqsave(&fl->dspsignals_lock, fflags);
@@ -5702,8 +5792,17 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 
 	spin_lock_irqsave(&fl->apps->hlock, irq_flags);
 	is_locked = true;
-	if (fl->is_dma_invoke_pend)
-		wait_for_completion(&fl->dma_invoke);
+	if (!fl->is_dma_invoke_pend)
+		goto skip_dmainvoke_wait;
+	is_locked = false;
+	spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
+	wait_for_completion(&fl->dma_invoke);
+
+skip_dmainvoke_wait:
+	if (!is_locked) {
+		spin_lock_irqsave(&fl->apps->hlock, irq_flags);
+		is_locked = true;
+	}
 	if (!fl->is_ramdump_pend)
 		goto skip_dump_wait;
 	is_locked = false;
@@ -5719,6 +5818,10 @@ skip_dump_wait:
 	fl->is_ramdump_pend = false;
 	fl->is_dma_invoke_pend = false;
 	fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
+	VERIFY(err, VALID_FASTRPC_CID(cid));
+	/* Reset the tgid usage to false */
+	if (!err)
+		frpc_tgid_usage_array[cid][fl->tgid_frpc] = false;
 	is_locked = false;
 	spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
 
@@ -5787,13 +5890,13 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
 	struct fastrpc_file *fl = (struct fastrpc_file *)file->private_data;
 	struct fastrpc_apps *me = &gfa;
-	u32 ii;
+	unsigned int ii;
 
 	if (!fl)
 		return 0;
 
 	if (fl->qos_request && fl->dev_pm_qos_req) {
-		for (ii = 0; ii < me->silvercores.corecount; ii++) {
+		for (ii = 0; ii < me->lowest_capacity_core_count; ii++) {
 			if (!dev_pm_qos_request_active(&fl->dev_pm_qos_req[ii]))
 				continue;
 			dev_pm_qos_remove_request(&fl->dev_pm_qos_req[ii]);
@@ -6169,6 +6272,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	fl->apps = me;
 	fl->mode = FASTRPC_MODE_SERIAL;
 	fl->cid = -1;
+	fl->tgid_frpc = -1;
 	fl->tvm_remote_domain = -1;
 	fl->dev_minor = dev_minor;
 	fl->init_mem = NULL;
@@ -6180,6 +6284,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	fl->is_compat = false;
 	fl->exit_notif = false;
 	fl->exit_async = false;
+	fl->multi_session_support = false;
 	init_completion(&fl->work);
 	init_completion(&fl->dma_invoke);
 	fl->file_close = FASTRPC_PROCESS_DEFAULT_STATE;
@@ -6190,9 +6295,10 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	spin_lock_irqsave(&me->hlock, irq_flags);
 	hlist_add_head(&fl->hn, &me->drivers);
 	spin_unlock_irqrestore(&me->hlock, irq_flags);
-	fl->dev_pm_qos_req = kcalloc(me->silvercores.corecount,
-				sizeof(struct dev_pm_qos_request),
-				GFP_KERNEL);
+	if (me->lowest_capacity_core_count)
+		fl->dev_pm_qos_req = kzalloc((me->lowest_capacity_core_count) *
+						sizeof(struct dev_pm_qos_request),
+							GFP_KERNEL);
 	spin_lock_init(&fl->dspsignals_lock);
 	mutex_init(&fl->signal_create_mutex);
 	init_completion(&fl->shutdown);
@@ -6227,6 +6333,25 @@ bail:
 	return err;
 }
 
+// Generate a unique process ID to DSP process
+static int get_unique_hlos_process_id(uint32_t cid)
+{
+	int tgid_frpc = -1, tgid_index = 1;
+	struct fastrpc_apps *me = &gfa;
+
+	spin_lock(&me->hlock);
+	for (tgid_index = 1; tgid_index < MAX_FRPC_TGID; tgid_index++) {
+		if (!frpc_tgid_usage_array[cid][tgid_index]) {
+			tgid_frpc = tgid_index;
+			/* Set the tgid usage to false */
+			frpc_tgid_usage_array[cid][tgid_index] = true;
+			break;
+		}
+	}
+	spin_unlock(&me->hlock);
+	return tgid_frpc;
+}
+
 static int fastrpc_set_process_info(struct fastrpc_file *fl, uint32_t cid)
 {
 	int err = 0, buf_size = 0;
@@ -6236,6 +6361,13 @@ static int fastrpc_set_process_info(struct fastrpc_file *fl, uint32_t cid)
 	memcpy(cur_comm, current->comm, TASK_COMM_LEN);
 	cur_comm[TASK_COMM_LEN-1] = '\0';
 	fl->tgid = current->tgid;
+	fl->tgid_frpc = get_unique_hlos_process_id(cid);
+	VERIFY(err, fl->tgid_frpc != -1);
+	if (err) {
+		ADSPRPC_ERR("too many fastrpc clients, max %u allowed\n", MAX_FRPC_TGID);
+		err = -EUSERS;
+		goto bail;
+	}
 
 	/*
 	 * Third-party apps don't have permission to open the fastrpc device, so
@@ -6268,8 +6400,11 @@ static int fastrpc_set_process_info(struct fastrpc_file *fl, uint32_t cid)
 			err = -ENOMEM;
 			return err;
 		}
-		snprintf(fl->debug_buf, buf_size, "%.10s%s%d%s%d",
-			cur_comm, "_", current->pid, "_", cid);
+		/* Use HLOS PID, unique fastrpc PID, CID in debugfs filename,
+		 * for better ability to debug
+		 */
+		snprintf(fl->debug_buf, buf_size, "%.10s%s%d%s%d%s%d",
+			cur_comm, "_", current->pid, "_", fl->tgid_frpc, "_", cid);
 		fl->debugfs_file = debugfs_create_file(fl->debug_buf, 0644,
 			debugfs_root, fl, &debugfs_fops);
 		if (IS_ERR_OR_NULL(fl->debugfs_file)) {
@@ -6295,6 +6430,11 @@ int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
 		err = -EBADF;
 		goto bail;
 	}
+	VERIFY(err, VALID_FASTRPC_CID(cid));
+	if (err) {
+		err = -ECHRNG;
+		goto bail;
+	}
 
 	fastrpc_get_process_gids(&fl->gidlist);
 	err = fastrpc_set_process_info(fl, cid);
@@ -6304,11 +6444,6 @@ int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
 	if (fl->cid == -1) {
 		struct fastrpc_channel_ctx *chan = NULL;
 
-		VERIFY(err, cid < NUM_CHANNELS);
-		if (err) {
-			err = -ECHRNG;
-			goto bail;
-		}
 		chan = &me->channel[cid];
 		/* Check to see if the device node is non-secure */
 		if (fl->dev_minor == MINOR_NUM_DEV) {
@@ -6389,8 +6524,7 @@ int fastrpc_internal_control(struct fastrpc_file *fl,
 	int err = 0;
 	unsigned int latency;
 	struct fastrpc_apps *me = &gfa;
-	int sessionid = 0;
-	u32 silver_core_count = me->silvercores.corecount, ii = 0, cpu;
+	unsigned int cpu;
 	unsigned long flags = 0;
 
 	VERIFY(err, !IS_ERR_OR_NULL(fl) && !IS_ERR_OR_NULL(fl->apps));
@@ -6414,23 +6548,29 @@ int fastrpc_internal_control(struct fastrpc_file *fl,
 			goto bail;
 		}
 
-		VERIFY(err, me->silvercores.coreno && fl->dev_pm_qos_req);
+		VERIFY(err, (me->lowest_capacity_core_count && fl->dev_pm_qos_req));
 		if (err) {
+			ADSPRPC_INFO("Skipping PM QoS latency voting, core count: %u\n",
+						me->lowest_capacity_core_count);
 			err = -EINVAL;
 			goto bail;
 		}
+		/*
+		 * Add voting request for all possible cores corresponding to cluster
+		 * id 0. If DT property 'qcom,single-core-latency-vote' is enabled
+		 * then add voting request for only one core of cluster id 0.
+		 */
+		for (cpu = 0; cpu < me->lowest_capacity_core_count; cpu++) {
 
-		for (ii = 0; ii < silver_core_count; ii++) {
-			cpu = me->silvercores.coreno[ii];
 			if (!fl->qos_request) {
 				err = dev_pm_qos_add_request(
 						get_cpu_device(cpu),
-						&fl->dev_pm_qos_req[ii],
+						&fl->dev_pm_qos_req[cpu],
 						DEV_PM_QOS_RESUME_LATENCY,
 						latency);
 			} else {
 				err = dev_pm_qos_update_request(
-						&fl->dev_pm_qos_req[ii],
+						&fl->dev_pm_qos_req[cpu],
 						latency);
 			}
 			/* PM QoS request APIs return 0 or 1 on success */
@@ -6444,7 +6584,6 @@ int fastrpc_internal_control(struct fastrpc_file *fl,
 			fl->qos_request = 1;
 			err = 0;
 		}
-
 		/* Ensure CPU feature map updated to DSP for early WakeUp */
 		fastrpc_send_cpuinfo_to_dsp(fl);
 		break;
@@ -6480,9 +6619,7 @@ int fastrpc_internal_control(struct fastrpc_file *fl,
 		break;
 	case FASTRPC_CONTROL_DSPPROCESS_CLEAN:
 		(void)fastrpc_release_current_dsp_process(fl);
-		if (fl->tgid & SESSION_ID_MASK)
-			sessionid = 1;
-		fastrpc_queue_pd_status(fl, fl->cid, FASTRPC_USER_PD_FORCE_KILL, sessionid);
+		fastrpc_queue_pd_status(fl, fl->cid, FASTRPC_USER_PD_FORCE_KILL, fl->sessionid);
 		break;
 	case FASTRPC_CONTROL_RPC_POLL:
 		err = fastrpc_manage_poll_mode(fl, cp->lp.enable, cp->lp.latency);
@@ -6564,8 +6701,8 @@ int fastrpc_setmode(unsigned long ioctl_param,
 				"multiple sessions not allowed for untrusted apps\n");
 			goto bail;
 		}
-		fl->sessionid = 1;
-		fl->tgid |= SESSION_ID_MASK;
+		if (!fl->multi_session_support)
+			fl->sessionid = 1;
 		break;
 	default:
 		err = -ENOTTY;
@@ -6636,8 +6773,9 @@ int fastrpc_dspsignal_signal(struct fastrpc_file *fl,
 	// track outgoing signals in the driver. The userspace library does a
 	// basic sanity check and any security validation needs to be done by
 	// the recipient.
-	DSPSIGNAL_VERBOSE("Send signal PID %u, signal %u\n",
-			  (unsigned int)fl->tgid, (unsigned int)sig->signal_id);
+	DSPSIGNAL_VERBOSE("Send signal PID %u, unique fastrpc pid %u signal %u\n",
+			(unsigned int)fl->tgid, (unsigned int)fl->tgid_frpc,
+			(unsigned int)sig->signal_id);
 	VERIFY(err, sig->signal_id < DSPSIGNAL_NUM_SIGNALS);
 	if (err) {
 		ADSPRPC_ERR("Sending bad signal %u for PID %u",
@@ -6661,7 +6799,8 @@ int fastrpc_dspsignal_signal(struct fastrpc_file *fl,
 		goto bail;
 	}
 
-	msg = (((uint64_t)fl->tgid) << 32) | ((uint64_t)sig->signal_id);
+	/* Use unique fastrpc pid, to signal DSP process */
+	msg = (((uint64_t)fl->tgid_frpc) << 32) | ((uint64_t)sig->signal_id);
 	err = fastrpc_transport_send(cid, (void *)&msg, sizeof(msg), fl->tvm_remote_domain);
 	mutex_unlock(&channel_ctx->smd_mutex);
 
@@ -7485,6 +7624,14 @@ static void  fastrpc_print_debug_data(int cid)
 	kfree(gmsg_log_rx);
 }
 
+void fastrpc_restart_drivers(int cid)
+{
+	struct fastrpc_apps *me = &gfa;
+
+	fastrpc_notify_drivers(me, cid);
+	me->channel[cid].ssrcount++;
+}
+
 static int fastrpc_restart_notifier_cb(struct notifier_block *nb,
 					unsigned long code,
 					void *data)
@@ -7701,10 +7848,10 @@ static int fastrpc_cb_probe(struct device *dev)
 	if (of_get_property(dev->of_node, "pd-type", NULL) != NULL) {
 		err = of_property_read_u32(dev->of_node, "pd-type",
 				&(sess->smmu.pd_type));
+		/* Set cb_pd_type, if the process type is set for context banks */
+		me->cb_pd_type = true;
 		if (err)
 			goto bail;
-		// Set cb_pd_type, if the process type is configured for context banks
-		me->cb_pd_type = true;
 	}
 	if (of_get_property(dev->of_node, "shared-cb", NULL) != NULL) {
 		sess->smmu.sharedcb = 1;
@@ -7868,39 +8015,6 @@ bail:
 	}
 }
 
-static void init_qos_cores_list(struct device *dev, char *prop_name,
-						struct qos_cores *silvercores)
-{
-	int err = 0;
-	u32 len = 0, i = 0;
-	u32 *coreslist = NULL;
-
-	if (!of_find_property(dev->of_node, prop_name, &len))
-		goto bail;
-	if (len == 0)
-		goto bail;
-	len /= sizeof(u32);
-	VERIFY(err, NULL != (coreslist = kcalloc(len, sizeof(u32),
-						 GFP_KERNEL)));
-	if (err)
-		goto bail;
-	for (i = 0; i < len; i++) {
-		err = of_property_read_u32_index(dev->of_node, prop_name, i,
-								&coreslist[i]);
-		if (err) {
-			pr_err("adsprpc: %s: failed to read QOS cores list\n",
-								 __func__);
-			goto bail;
-		}
-	}
-	silvercores->coreno = coreslist;
-	silvercores->corecount = len;
-bail:
-	if (err)
-		kfree(coreslist);
-
-}
-
 static void fastrpc_init_privileged_gids(struct device *dev, char *prop_name,
 						struct gid_list *gidlist)
 {
@@ -7999,15 +8113,15 @@ bail:
 }
 
 /*
- * remote_cdsp_status_show - Updates the buffer with remote cdsp status
- *                           by reading the fastrpc node.
+ * fastrpc_nsp_status_show() - Updates the buffer with remote nsp status
+ * by reading the fastrpc node.
  * @dev : pointer to device node.
  * @attr: pointer to device attribute.
- * @buf : Output parameter to be updated with remote cdsp status.
+ * @buf : Output parameter to be updated with remote nsp status.
  * Return : bytes written to buffer.
  */
 
-static ssize_t remote_cdsp_status_show(struct device *dev,
+static ssize_t fastrpc_nsp_status_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct fastrpc_apps *me = &gfa;
@@ -8024,15 +8138,15 @@ static ssize_t remote_cdsp_status_show(struct device *dev,
 	}
 
 	return scnprintf(buf, PAGE_SIZE, "%d",
-			me->remote_cdsp_status);
+			me->fastrpc_nsp_status);
 }
 
-/* Remote cdsp status attribute declaration as read only */
-static DEVICE_ATTR_RO(remote_cdsp_status);
+/* Remote nsp status attribute declaration as read only */
+static DEVICE_ATTR_RO(fastrpc_nsp_status);
 
 /* Declaring attribute for remote dsp */
 static struct attribute *msm_remote_dsp_attrs[] = {
-	&dev_attr_remote_cdsp_status.attr,
+	&dev_attr_fastrpc_nsp_status.attr,
 	NULL
 };
 
@@ -8062,11 +8176,18 @@ static int fastrpc_probe(struct platform_device *pdev)
 							&gcinfo[0].rhvm);
 		fastrpc_init_privileged_gids(dev, "qcom,fastrpc-gids",
 					&me->gidlist);
-		init_qos_cores_list(dev, "qcom,qos-cores",
-							&me->silvercores);
-
+		/*
+		 * Check if latency voting for only one core
+		 * is enabled for the platform
+		 */
+		me->single_core_latency_vote = of_property_read_bool(dev->of_node,
+							"qcom,single-core-latency-vote");
+		if (me->single_core_latency_vote)
+			me->lowest_capacity_core_count = 1;
 		of_property_read_u32(dev->of_node, "qcom,rpc-latency-us",
 			&me->latency);
+		of_property_read_u32(dev->of_node, "qcom,max-sessions",
+			&me->max_sess_per_proc);
 		if (of_get_property(dev->of_node,
 			"qcom,secure-domains", NULL) != NULL) {
 			VERIFY(err, !of_property_read_u32(dev->of_node,
@@ -8433,32 +8554,33 @@ static struct device fastrpc_bus = {
 
 static int fastrpc_bus_match(struct device *dev, struct device_driver *driver)
 {
+	struct fastrpc_apps *me = &gfa;
 	struct fastrpc_driver *frpc_driver = to_fastrpc_driver(driver);
 	struct fastrpc_device *frpc_device = to_fastrpc_device(dev);
+	unsigned long irq_flags = 0;
 
-	if (frpc_device->handle == frpc_driver->handle)
+	if (frpc_device->handle == frpc_driver->handle) {
+		spin_lock_irqsave(&me->hlock, irq_flags);
+		/* If device is being closed, fail the match */
+		if (frpc_device->dev_close) {
+			spin_unlock_irqrestore(&me->hlock, irq_flags);
+			return 0;
+		}
+		frpc_device->refs++;
+		frpc_driver->device = dev;
+		spin_unlock_irqrestore(&me->hlock, irq_flags);
 		return 1;
+	}
 	return 0;
 }
 
 static int fastrpc_bus_probe(struct device *dev)
 {
-	struct fastrpc_apps *me = &gfa;
 	struct fastrpc_device *frpc_dev = to_fastrpc_device(dev);
 	struct fastrpc_driver *frpc_drv = to_fastrpc_driver(dev->driver);
-	unsigned long irq_flags = 0;
 
-	if (frpc_drv && frpc_drv->probe) {
-		spin_lock_irqsave(&me->hlock, irq_flags);
-		if (frpc_dev->dev_close) {
-			spin_unlock_irqrestore(&me->hlock, irq_flags);
-			return 0;
-		}
-		frpc_dev->refs++;
-		frpc_drv->device = dev;
-		spin_unlock_irqrestore(&me->hlock, irq_flags);
+	if (frpc_drv && frpc_drv->probe)
 		return frpc_drv->probe(frpc_dev);
-	}
 
 	return 0;
 }
@@ -8499,17 +8621,23 @@ static int fastrpc_device_create(struct fastrpc_file *fl)
 	frpc_dev->dev.parent = &fastrpc_bus;
 	frpc_dev->dev.bus = &fastrpc_bus_type;
 
-	dev_set_name(&frpc_dev->dev, "%s-%d-%d",
-			dev_name(frpc_dev->dev.parent), fl->tgid, fl->cid);
+	/* Use HLOS PID, unique fastrpc process ID and CID to create device file,
+	 * Else names would conflict for multiple sessions
+	 * And also for better ability to debug
+	 */
+	dev_set_name(&frpc_dev->dev, "%s-%d-%d-%d",
+			dev_name(frpc_dev->dev.parent), fl->tgid, fl->tgid_frpc, fl->cid);
 	frpc_dev->dev.release = fastrpc_dev_release;
 	frpc_dev->fl = fl;
-	frpc_dev->handle = fl->tgid;
+	/* Use unique fastrpc tgid as handle */
+	frpc_dev->handle = fl->tgid_frpc;
 
 	err = device_register(&frpc_dev->dev);
 	if (err) {
 		put_device(&frpc_dev->dev);
-		ADSPRPC_ERR("fastrpc device register failed for process %d with error %d\n",
-			fl->tgid, err);
+		ADSPRPC_ERR(
+		"fastrpc device register failed for process %d unique fastrpc tgid %d session %d with error %d\n",
+			fl->tgid, fl->tgid_frpc, fl->sessionid, err);
 		goto bail;
 	}
 	fl->device = frpc_dev;
@@ -8598,7 +8726,7 @@ static int __init fastrpc_device_init(void)
 	}
 	memset(me, 0, sizeof(*me));
 	fastrpc_init(me);
-	fastrpc_get_dsp_status(me);
+	fastrpc_get_nsp_status(me);
 	me->dev = NULL;
 	me->legacy_remote_heap = false;
 	err = bus_register(&fastrpc_bus_type);
@@ -8614,6 +8742,7 @@ static int __init fastrpc_device_init(void)
 		goto bus_device_register_bail;
 	}
 	me->fastrpc_bus_register = true;
+	fastrpc_lowest_capacity_corecount(me);
 	VERIFY(err, 0 == platform_driver_register(&fastrpc_driver));
 	if (err)
 		goto register_bail;
