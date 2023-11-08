@@ -4351,6 +4351,8 @@ static int fastrpc_init_create_static_process(struct fastrpc_file *fl,
 			mutex_lock(&fl->map_mutex);
 			err = fastrpc_mmap_create(fl, -1, NULL, 0, init->mem,
 				 init->memlen, ADSP_MMAP_REMOTE_HEAP_ADDR, &mem);
+			if (mem)
+				mem->is_filemap = true;
 			mutex_unlock(&fl->map_mutex);
 			if (err || (!mem))
 				goto bail;
@@ -5476,6 +5478,7 @@ int fastrpc_internal_mem_map(struct fastrpc_file *fl,
 	int err = 0;
 	struct fastrpc_mmap *map = NULL;
 
+	mutex_lock(&fl->internal_map_mutex);
 	VERIFY(err, fl->dsp_proc_init == 1);
 	if (err) {
 		pr_err("adsprpc: ERROR: %s: user application %s trying to map without initialization\n",
@@ -5514,6 +5517,7 @@ bail:
 			mutex_unlock(&fl->map_mutex);
 		}
 	}
+	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
 
@@ -5524,6 +5528,7 @@ int fastrpc_internal_mem_unmap(struct fastrpc_file *fl,
 	struct fastrpc_mmap *map = NULL;
 	size_t map_size = 0;
 
+	mutex_lock(&fl->internal_map_mutex);
 	VERIFY(err, fl->dsp_proc_init == 1);
 	if (err) {
 		pr_err("adsprpc: ERROR: %s: user application %s trying to map without initialization\n",
@@ -5570,6 +5575,7 @@ bail:
 			mutex_unlock(&fl->map_mutex);
 		}
 	}
+	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
 
