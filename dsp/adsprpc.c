@@ -1011,14 +1011,13 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 		map->refs--;
 		if (!map->refs && !map->is_persistent && !map->ctx_refs)
 			hlist_del_init(&map->hn);
-		spin_unlock_irqrestore(&me->hlock, irq_flags);
 		if (map->refs > 0) {
 			ADSPRPC_WARN(
 				"multiple references for remote heap size %zu va 0x%lx ref count is %d\n",
 				map->size, map->va, map->refs);
+			spin_unlock_irqrestore(&me->hlock, irq_flags);
 			return;
 		}
-		spin_lock_irqsave(&me->hlock, irq_flags);
 		if (map->is_persistent && map->in_use)
 			map->in_use = false;
 		spin_unlock_irqrestore(&me->hlock, irq_flags);
@@ -1168,8 +1167,13 @@ static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access, bool *hl
 	*exclusive_access = false;
 	*hlos_access = false;
 	err = mem_buf_dma_buf_get_vmperm(buf, &vmids_list, &perms, &vmids_list_len);
-	if (err)
+	if (err) {
+		if (err == -EINVAL) {
+			*exclusive_access = true;
+			err = 0;
+		}
 		goto bail;
+	}
 
 	/*
 	 * If one VM has access to buffer and is the current VM,
