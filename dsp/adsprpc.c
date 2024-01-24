@@ -1011,14 +1011,13 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 		map->refs--;
 		if (!map->refs && !map->is_persistent && !map->ctx_refs)
 			hlist_del_init(&map->hn);
-		spin_unlock_irqrestore(&me->hlock, irq_flags);
 		if (map->refs > 0) {
 			ADSPRPC_WARN(
 				"multiple references for remote heap size %zu va 0x%lx ref count is %d\n",
 				map->size, map->va, map->refs);
+			spin_unlock_irqrestore(&me->hlock, irq_flags);
 			return;
 		}
-		spin_lock_irqsave(&me->hlock, irq_flags);
 		if (map->is_persistent && map->in_use)
 			map->in_use = false;
 		spin_unlock_irqrestore(&me->hlock, irq_flags);
@@ -2331,7 +2330,7 @@ static void fastrpc_notify_drivers(struct fastrpc_apps *me, int cid)
 	spin_lock_irqsave(&me->hlock, irq_flags);
 	hlist_for_each_entry_safe(fl, n, &me->drivers, hn) {
 		if (fl->cid == cid) {
-			fastrpc_queue_pd_status(fl, cid, FASTRPC_DSP_SSR, 0);
+			fastrpc_queue_pd_status(fl, cid, FASTRPC_DSP_SSR, fl->sessionid);
 			fastrpc_notify_users(fl);
 		}
 	}
@@ -3512,9 +3511,13 @@ static int fastrpc_wait_on_async_queue(
 	struct hlist_node *n;
 
 read_async_job:
+	if (!fl) {
+		err = -EBADF;
+		goto bail;
+	}
 	interrupted = wait_event_interruptible(fl->async_wait_queue,
 				atomic_read(&fl->async_queue_job_count));
-	if (!fl || fl->file_close >= FASTRPC_PROCESS_EXIT_START) {
+	if (fl->file_close >= FASTRPC_PROCESS_EXIT_START) {
 		err = -EBADF;
 		goto bail;
 	}
@@ -3598,12 +3601,12 @@ static int fastrpc_wait_on_notif_queue(
 	struct smq_notif_rsp  *notif = NULL, *inotif = NULL, *n = NULL;
 
 read_notif_status:
+        if (!fl) {
+                err = -EBADF;
+                goto bail;
+        }
 	interrupted = wait_event_interruptible(fl->proc_state_notif.notif_wait_queue,
 				atomic_read(&fl->proc_state_notif.notif_queue_count));
-	if (!fl) {
-		err = -EBADF;
-		goto bail;
-	}
 	if (fl->exit_notif) {
 		err = -EFAULT;
 		goto bail;
@@ -5958,13 +5961,15 @@ skip_dump_wait:
 	fl->is_ramdump_pend = false;
 	fl->is_dma_invoke_pend = false;
 	fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
-	/* Reset the tgid usage to false */
-	if (fl->tgid_frpc != -1)
-		frpc_tgid_usage_array[fl->tgid_frpc] = false;
 	is_locked = false;
 	spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
 
 	if (!fl->sctx) {
+		spin_lock_irqsave(&me->hlock, irq_flags);
+		/* Reset the tgid usage to false */
+		if (fl->tgid_frpc != -1)
+			frpc_tgid_usage_array[fl->tgid_frpc] = false;
+		spin_unlock_irqrestore(&me->hlock, irq_flags);
 		kfree(fl);
 		return 0;
 	}
@@ -6006,6 +6011,12 @@ skip_dump_wait:
 
 	if (fl->device && is_driver_closed)
 		device_unregister(&fl->device->dev);
+
+	spin_lock_irqsave(&me->hlock, irq_flags);
+	/* Reset the tgid usage to false */
+	if (fl->tgid_frpc != -1)
+		frpc_tgid_usage_array[fl->tgid_frpc] = false;
+	spin_unlock_irqrestore(&me->hlock, irq_flags);
 
 	VERIFY(err, VALID_FASTRPC_CID(cid));
 	if (!err && fl->sctx)
@@ -6818,6 +6829,13 @@ static int fastrpc_check_pd_status(struct fastrpc_file *fl, char *sloc_name)
 		err = fastrpc_get_spd_session(sloc_name, &session, &cid);
 		if (err || cid != fl->cid)
 			goto bail;
+		if ((!strcmp(fl->servloc_name,
+			AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME)) &&
+			(me->channel[cid].spd[session].pdrcount !=
+			me->channel[cid].spd[session].prevpdrcount)) {
+			err = -ECONNRESET;
+			goto bail;
+		}
 #if IS_ENABLED(CONFIG_QCOM_PDR_HELPERS)
 		if (!strcmp(fl->servloc_name,
 			AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME) || !strcmp(fl->servloc_name,
@@ -7613,20 +7631,20 @@ static void  fastrpc_print_debug_data(int cid)
 	VERIFY(err, NULL != (gmsg_log_tx = kzalloc(MD_GMSG_BUFFER, GFP_KERNEL)));
 	if (err) {
 		err = -ENOMEM;
-		return;
+		goto free_buf;
 	}
 	VERIFY(err, NULL != (gmsg_log_rx = kzalloc(MD_GMSG_BUFFER, GFP_KERNEL)));
 	if (err) {
 		err = -ENOMEM;
-		return;
+                goto free_buf;
 	}
 	chan = &me->channel[cid];
 	if ((!chan) || (!chan->buf))
-		return;
+                goto free_buf;
 
 	mini_dump_buff = chan->buf->virt;
 	if (!mini_dump_buff)
-		return;
+                goto free_buf;
 
 	if (chan) {
 		tx_index = chan->gmsg_log.tx_index;
@@ -7634,7 +7652,7 @@ static void  fastrpc_print_debug_data(int cid)
 	}
 	spin_lock_irqsave(&me->hlock, irq_flags);
 	hlist_for_each_entry_safe(fl, n, &me->drivers, hn) {
-		if (fl->cid == cid) {
+		if (fl->cid == cid && fl->is_ramdump_pend) {
 			scnprintf(mini_dump_buff +
 					strlen(mini_dump_buff),
 					MINI_DUMP_DBG_SIZE -
@@ -7772,6 +7790,7 @@ static void  fastrpc_print_debug_data(int cid)
 			"gmsg_log_rx:\n %s\n", gmsg_log_rx);
 	if (chan && chan->buf)
 		chan->buf->size = strlen(mini_dump_buff);
+free_buf:
 	kfree(gmsg_log_tx);
 	kfree(gmsg_log_rx);
 }
