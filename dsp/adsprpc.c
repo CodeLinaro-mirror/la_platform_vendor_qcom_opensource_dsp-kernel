@@ -2369,6 +2369,8 @@ static void fastrpc_context_list_dtor(struct fastrpc_file *fl)
 	struct fastrpc_ctx_lst *clst = &fl->clst;
 	struct smq_invoke_ctx *ictx = NULL, *ctxfree;
 	struct hlist_node *n;
+	unsigned long irq_flags = 0;
+	struct smq_notif_rsp *inotif = NULL, *n1 = NULL;
 
 	do {
 		ctxfree = NULL;
@@ -2396,6 +2398,14 @@ static void fastrpc_context_list_dtor(struct fastrpc_file *fl)
 		if (ctxfree)
 			context_free(ctxfree);
 	} while (ctxfree);
+
+	spin_lock_irqsave(&fl->proc_state_notif.nqlock, irq_flags);
+	list_for_each_entry_safe(inotif, n1, &clst->notif_queue, notifn) {
+		list_del_init(&inotif->notifn);
+		atomic_sub(1, &fl->proc_state_notif.notif_queue_count);
+		kfree(inotif);
+	}
+	spin_unlock_irqrestore(&fl->proc_state_notif.nqlock, irq_flags);
 }
 
 static int fastrpc_file_free(struct fastrpc_file *fl);
@@ -2612,6 +2622,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		struct fastrpc_mmap *map = ctx->maps[i];
 		uint64_t buf = ptr_to_uint64(lpra[i].buf.pv);
 		size_t len = lpra[i].buf.len;
+		uint64_t buf_start = 0;
 
 		rpra[i].buf.pv = 0;
 		rpra[i].buf.len = len;
@@ -2633,7 +2644,17 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 					up_read(&current->mm->mmap_lock);
 					goto bail;
 				}
-				offset = buf_page_start(buf) - vma->vm_start;
+				buf_start = buf_page_start(buf);
+				VERIFY(err, vma->vm_start <= buf_start);
+				if (err) {
+					up_read(&current->mm->mmap_lock);
+					ADSPRPC_ERR(
+						"buffer VA invalid for fd %d, IPA 0x%llx, VA 0x%llx, vma start 0x%llx\n",
+						map->fd, map->phys, map->va, vma->vm_start);
+					err = -EFAULT;
+					goto bail;
+				}
+				offset = buf_start - vma->vm_start;
 				up_read(&current->mm->mmap_lock);
 				VERIFY(err, offset + len <= (uintptr_t)map->size);
 				if (err) {
