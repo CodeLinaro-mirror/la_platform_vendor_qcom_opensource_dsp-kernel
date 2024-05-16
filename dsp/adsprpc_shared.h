@@ -785,6 +785,7 @@ struct fastrpc_mmap {
 	struct timespec64 map_end_time;
 	/* Mapping for fastrpc shell */
 	bool is_filemap;
+	bool is_dumped;				/* flag to indicate map is dumped during SSR */
 	char *servloc_name;			/* Indicate which daemon mapped this */
 	/* Indicates map is being used by a pending RPC call */
 	unsigned int ctx_refs;
@@ -844,6 +845,7 @@ struct fastrpc_file {
 	struct fastrpc_ctx_lst clst;
 	struct fastrpc_session_ctx *sctx;
 	struct fastrpc_buf *init_mem;
+	struct kref refcount;
 
 	/* No. of persistent headers */
 	unsigned int num_pers_hdrs;
