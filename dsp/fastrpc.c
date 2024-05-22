@@ -295,9 +295,12 @@ static bool fastrpc_get_persistent_buf(struct fastrpc_user *fl,
 
 static void __fastrpc_dma_buf_free(struct fastrpc_buf *buf)
 {
+	uint32_t sid_pos = (buf->smmucb ? buf->smmucb->sid_pos :
+							DSP_DEFAULT_BUS_WIDTH);
+
 	trace_fastrpc_dma_free(buf->domain_id, buf->phys, buf->size);
 	dma_free_coherent(buf->dev, buf->size, buf->virt,
-			  FASTRPC_PHYS(buf->phys));
+		IOVA_TO_PHYSADDR(buf->phys, sid_pos));
 	kfree(buf);
 }
 
@@ -488,7 +491,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 			__fastrpc_dma_alloc(buf);
 		if (buf->virt) {
 			smmucb->allocatedbytes += SMMU_ALIGN(buf->size);
-			buf->phys += ((u64)smmucb->sid << 32);
+			RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
+				buf->phys, smmucb->sid_pos);
 		}
 		mutex_unlock(&smmucb->map_mutex);
 	}
@@ -956,7 +960,8 @@ static int fastrpc_dma_buf_attach(struct dma_buf *dmabuf,
 		return -ENOMEM;
 
 	ret = dma_get_sgtable(buffer->dev, &a->sgt, buffer->virt,
-			      FASTRPC_PHYS(buffer->phys), buffer->size);
+			IOVA_TO_PHYSADDR(buffer->phys, buffer->smmucb->sid_pos),
+			buffer->size);
 	if (ret < 0) {
 		dev_err(buffer->dev, "failed to get scatterlist from DMA API\n");
 		kfree(a);
@@ -1003,7 +1008,8 @@ static int fastrpc_mmap(struct dma_buf *dmabuf,
 	size_t size = vma->vm_end - vma->vm_start;
 
 	return dma_mmap_coherent(buf->dev, vma, buf->virt,
-				 FASTRPC_PHYS(buf->phys), size);
+				IOVA_TO_PHYSADDR(buf->phys,
+					buf->smmucb->sid_pos), size);
 }
 
 static const struct dma_buf_ops fastrpc_dma_buf_ops = {
@@ -1017,14 +1023,13 @@ static const struct dma_buf_ops fastrpc_dma_buf_ops = {
 };
 
 static struct fastrpc_pool_ctx *fastrpc_session_alloc(
-				struct fastrpc_user *fl, bool secure)
+				struct fastrpc_user *fl, bool secure, int pd_type)
 {
 
 	struct fastrpc_pool_ctx *session = NULL, *isess = NULL;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	unsigned long flags;
 	bool sharedcb = fl->sharedcb;
-	int pd_type = fl->pd_type;
 	int i;
 
 	if (!cctx->dev)
@@ -1195,12 +1200,14 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 				  bool take_ref)
 {
 	struct fastrpc_pool_ctx *sess = NULL;
+	struct fastrpc_pool_ctx **pool_ctx = NULL;
 	struct fastrpc_map *map = NULL;
 	struct scatterlist *sgl = NULL;
 	int err = 0, sgl_index = 0;
 	struct device *dev = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
-	u32 smmuidx = DEFAULT_SMMU_IDX;
+	u32 smmuidx = DEFAULT_SMMU_IDX, pd_type = 0;
+	bool secure = false;
 
 	if (!fastrpc_map_lookup(fl, fd, va, len, buf, mflags, ppmap, take_ref))
 		return 0;
@@ -1237,18 +1244,30 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 	if (err)
 		goto attach_err;
 
-	if (map->secure && (!(attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP))) {
-		if (!fl->secsctx) {
-			fl->secsctx = fastrpc_session_alloc(fl, true);
-			if (!fl->secsctx) {
-				dev_err(fl->cctx->dev, "No secure session available\n");
-				err = -EBUSY;
-				goto attach_err;
-			}
-		}
+	sess = fl->sctx;
+	pd_type = fl->pd_type;
+	pool_ctx = &fl->sctx;
+	if (map->secure && (!(attr & FASTRPC_ATTR_NOMAP
+				|| mflags == FASTRPC_MAP_FD_NOMAP))) {
 		sess = fl->secsctx;
-	} else {
-		sess = fl->sctx;
+		pool_ctx = &fl->secsctx;
+		secure = true;
+	} else if (mflags == FASTRPC_MAP_FD_EXTENDED
+				|| mflags == FASTRPC_MAP_FD_DELAYED_EXTENDED) {
+		sess = fl->extctx;
+		pool_ctx = &fl->extctx;
+		pd_type = EXT_MAP_PD_TYPE;
+	}
+	if (!sess) {
+		sess = fastrpc_session_alloc(fl, secure, pd_type);
+		if (!sess) {
+			dev_err(fl->cctx->dev,
+				"%s: no session available, pd type %d, secure %d\n",
+				__func__, pd_type, secure);
+			err = -EBUSY;
+			goto attach_err;
+		}
+		*pool_ctx = sess;
 	}
 
 map_retry:
@@ -1308,13 +1327,13 @@ map_retry:
 		map->va = (void *) (uintptr_t) va;
 		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	} else if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP){
-
 		map->phys = sg_dma_address(map->table->sgl);
 		map->size = sg_dma_len(map->table->sgl);
 		map->va = (void *) (uintptr_t) va;
 	} else {
 		map->phys = sg_dma_address(map->table->sgl);
-		map->phys += ((u64)smmucb->sid << 32);
+		RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
+			map->phys, smmucb->sid_pos);
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
 			sgl_index)
 			map->size += sg_dma_len(sgl);
@@ -2689,7 +2708,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (IS_ERR(name))
 		return PTR_ERR(name);
 
-	fl->sctx = fastrpc_session_alloc(fl, false);
+	fl->sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!fl->sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
@@ -3028,7 +3047,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (fl->is_unsigned_pd && fl->cctx->smmucb_pool)
 		fl->pd_type = USER_UNSIGNEDPD_POOL;
 
-	fl->sctx = fastrpc_session_alloc(fl, false);
+	fl->sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!fl->sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		return -EBUSY;
@@ -3562,7 +3581,7 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 		dev_err(fl->cctx->dev, "untrusted app trying to attach to privileged DSP PD\n");
 		return -EACCES;
 	}
-	fl->sctx = fastrpc_session_alloc(fl, false);
+	fl->sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!fl->sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		return -EBUSY;
@@ -5640,8 +5659,8 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 
 	/* Find any existing session for pooling CBs with same PD type */
 	for (i = 0; i < cctx->sesscount; i++) {
-		/* Only USER_UNSIGNEDPD_POOL type is pooled */
-		if (pd_type != USER_UNSIGNEDPD_POOL)
+		/* Only USER_UNSIGNEDPD_POOL or EXT_MAP_PD_TYPE type are pooled */
+		if (pd_type != USER_UNSIGNEDPD_POOL && pd_type != EXT_MAP_PD_TYPE)
 			break;
 
 		if (cctx->session[i].pd_type == pd_type) {
@@ -5671,7 +5690,19 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	smmucb->valid = true;
 	smmucb->dev = dev;
 	smmucb->sess = sess;
+	smmucb->pa_bits = DSP_DEFAULT_BUS_WIDTH;
 	mutex_init(&smmucb->map_mutex);
+
+	/*
+	 * If upstream bus size is specified for context bank in dtsi, then
+	 * use that value to configure the range of addresses allowed for
+	 * smmu mappings from this device.
+	 * If the property is not set, then use the default bus size.
+	 */
+	of_property_read_u32(dev->of_node, "ubs", &smmucb->pa_bits);
+
+	/* Configure where sid will be prepended to pa */
+	smmucb->sid_pos = (cctx->iova_format ? SID_POS_IN_IOVA : smmucb->pa_bits);
 
 	if (of_property_read_u32(dev->of_node, "reg", &smmucb->sid))
 		dev_info(dev, "FastRPC Session ID not specified in DT\n");
@@ -5784,7 +5815,9 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		smmucb->frpc_genpool_buf = buf;
 		dev_err(&pdev->dev, "fastrpc_cb_probe qrtr-gen-pool end\n");
 	}
-	rc = dma_set_mask(dev, DMA_BIT_MASK(32));
+
+	/* Mask determines range of addresses returned by smmu driver */
+	rc = dma_set_mask(dev, DMA_BIT_MASK(smmucb->pa_bits));
 	if (rc) {
 		dev_err(dev, "32-bit DMA enable failed\n");
 		return rc;
@@ -5811,7 +5844,8 @@ genpool_add_bail:
 genpool_create_bail:
 	iommu_unmap(domain, smmucb->genpool_iova, smmucb->genpool_size);
 iommu_map_bail:
-	dma_free_coherent(smmucb->dev, buf->size, buf->virt, FASTRPC_PHYS(buf->phys));
+	dma_free_coherent(smmucb->dev, buf->size, buf->virt,
+			IOVA_TO_PHYSADDR(buf->phys, smmucb->sid_pos));
 dma_alloc_bail:
 	kfree(buf);
 	return err;
@@ -5836,7 +5870,7 @@ static void fastrpc_genpool_free(struct fastrpc_smmu *smmucb)
 					smmucb->genpool_size);
 		if (buf->phys)
 			dma_free_coherent(buf->dev, buf->size, buf->virt,
-									FASTRPC_PHYS(buf->phys));
+				IOVA_TO_PHYSADDR(buf->phys, smmucb->sid_pos));
 		kfree(buf);
 		smmucb->frpc_genpool_buf = NULL;
 	}

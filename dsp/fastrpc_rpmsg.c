@@ -102,6 +102,10 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	    of_property_read_bool(rdev->of_node, "qcom,single-core-latency-vote"))
 		data->lowest_capacity_core_count = 1;
 
+	/* Read dtsi property to determine where sid needs to be prepended to pa */
+	err = of_property_read_u32(rdev->of_node, "qcom,dsp-iova-format",
+			&data->iova_format);
+
 	kref_init(&data->refcount);
 	dev_set_drvdata(&rpdev->dev, data);
 	rdev->dma_mask = &data->dma_mask;

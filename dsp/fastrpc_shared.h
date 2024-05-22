@@ -45,7 +45,6 @@
 #define FASTRPC_MAX_CRCLIST	64
 #define FASTRPC_KERNEL_PERF_LIST (PERF_KEY_MAX)
 #define FASTRPC_DSP_PERF_LIST 12
-#define FASTRPC_PHYS(p)	((p) & 0xffffffff)
 #define FASTRPC_INIT_HANDLE	1
 #define FASTRPC_DSP_UTILITIES_HANDLE	2
 #define FASTRPC_MAX_STATIC_HANDLE (20)
@@ -346,20 +345,44 @@
 #define COUNT_OF(number) (number == 0 ? 1 : FIND_DIGITS(number))
 
 /*
+ * By default, the sid will be prepended adjacent to smmu pa before sending
+ * to DSP. But if the chipset's dtsi specifies the new addressing format to
+ * handle pa's of longer widths, then the sid will be prepended at the
+ * position specified in this macro.
+ */
+#define SID_POS_IN_IOVA 56
+
+/* Default width of pa bus from dsp */
+#define DSP_DEFAULT_BUS_WIDTH 32
+
+/* Extract smmu pa from consolidated iova */
+#define IOVA_TO_PHYSADDR(iova, sid_pos) (iova & ((1ULL << sid_pos) - 1ULL))
+
+/*
+ * Prepare the consolidated iova to send to dsp by prepending the sid
+ * to smmu pa at the appropriate position
+ */
+#define RECONSTRUCT_IOVA_FROM_SID_PA(sid, phys, sid_pos) \
+	(phys += sid << sid_pos)
+
+/*
  * Process types on remote subsystem
  * Always add new PD types at the end, before MAX_PD_TYPE
  */
-#define DEFAULT_UNUSED       0  /* pd type not configured for context banks */
-#define ROOT_PD              1  /* Root PD */
-#define AUDIO_STATICPD       2  /* ADSP Audio Static PD */
-#define SENSORS_STATICPD     3  /* ADSP Sensors Static PD */
-#define SECURE_STATICPD      4  /* CDSP Secure Static PD */
-#define OIS_STATICPD         5  /* ADSP OIS Static PD */
-#define CPZ_USERPD           6  /* CDSP CPZ USER PD */
-#define USERPD               7  /* DSP User Dynamic PD */
-#define GUEST_OS_SHARED      8  /* Legacy Guest OS Shared */
-#define USER_UNSIGNEDPD_POOL 9  /* DSP User Dynamic Unsigned PD pool */
-#define MAX_PD_TYPE          10 /* Max PD type */
+enum fastrpc_cb_pd_types {
+	DEFAULT_UNUSED            = 0,  /* PD type not configured for context banks */
+	ROOT_PD                   = 1,  /* Root PD */
+	AUDIO_STATICPD            = 2,  /* ADSP Audio Static PD */
+	SENSORS_STATICPD          = 3,  /* ADSP Sensors Static PD */
+	SECURE_STATICPD           = 4,  /* CDSP Secure Static PD */
+	OIS_STATICPD              = 5,  /* ADSP OIS Static PD */
+	CPZ_USERPD                = 6,  /* CDSP CPZ USER PD */
+	USERPD                    = 7,  /* DSP User Dynamic PD */
+	GUEST_OS_SHARED           = 8,  /* Legacy Guest OS Shared */
+	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
+	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
+	MAX_PD_TYPE,                    /* Max PD type */
+};
 
 /* Attributes for internal purposes. Clients cannot query these */
 enum fastrpc_internal_attributes {
@@ -637,6 +660,10 @@ struct fastrpc_smmu {
 	u64 maxallocsize;
 	/* To indentify the parent session this SMMU CB belomngs to */
 	struct fastrpc_pool_ctx *sess;
+	/* Number of PA bits in IOVA */
+	u32 pa_bits;
+	/* Position of SID in IOVA */
+	u32 sid_pos;
 };
 
 struct fastrpc_pool_ctx {
@@ -725,6 +752,8 @@ struct fastrpc_channel_ctx {
 	struct completion ssr_complete;
 	/* Wait queue to block/resume SSR until all invocations are complete */
 	wait_queue_head_t ssr_wait_queue;
+	/* Format to control where sid is prepended to iova */
+	u32 iova_format;
 };
 
 struct fastrpc_invoke_ctx {
@@ -832,8 +861,19 @@ struct fastrpc_user {
 	struct list_head fastrpc_drivers;
 
 	struct fastrpc_channel_ctx *cctx;
+
+	/* Context bank(s) used for all regular buffer mappings */
 	struct fastrpc_pool_ctx *sctx;
+
+	/*
+	 * Context bank(s) used for secure buffer mappings after remote process
+	 * migrates to cpz
+	 */
 	struct fastrpc_pool_ctx *secsctx;
+
+	/* Context bank(s) used for extended addr space mappings */
+	struct fastrpc_pool_ctx *extctx;
+
 	struct fastrpc_buf *init_mem;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
