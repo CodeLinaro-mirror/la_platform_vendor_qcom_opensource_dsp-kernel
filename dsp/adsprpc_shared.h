@@ -845,6 +845,7 @@ struct fastrpc_file {
 	struct fastrpc_ctx_lst clst;
 	struct fastrpc_session_ctx *sctx;
 	struct fastrpc_buf *init_mem;
+	struct kref refcount;
 
 	/* No. of persistent headers */
 	unsigned int num_pers_hdrs;
@@ -899,8 +900,6 @@ struct fastrpc_file {
 	struct fastrpc_device *device;
 	/* Process kill will wait on work when ram dump collection in progress */
 	struct completion work;
-	/* Flag to indicate ram dump collection status*/
-	bool is_ramdump_pend;
 	/* Process kill will wait on bus driver invoke thread to complete its process */
 	struct completion dma_invoke;
 	/* Flag to indicate invoke pending */
