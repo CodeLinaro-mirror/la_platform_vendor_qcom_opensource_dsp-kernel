@@ -31,6 +31,9 @@
 #define FASTRPC_DEV_MAX		4 /* adsp, mdsp, slpi, cdsp*/
 #define FASTRPC_MAX_SESSIONS	14
 #define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
+
+/* Max number of SMMU context banks in a pool */
+#define FASTRPC_MAX_CB_POOL	7
 #define FASTRPC_MAX_SPD		4
 #define FASTRPC_MAX_VMIDS	16
 #define FASTRPC_ALIGN		128
@@ -39,11 +42,9 @@
 #define FASTRPC_KERNEL_PERF_LIST (PERF_KEY_MAX)
 #define FASTRPC_DSP_PERF_LIST 12
 #define FASTRPC_PHYS(p)	((p) & 0xffffffff)
-#define FASTRPC_CTX_MAX (256)
 #define FASTRPC_INIT_HANDLE	1
 #define FASTRPC_DSP_UTILITIES_HANDLE	2
 #define FASTRPC_MAX_STATIC_HANDLE (20)
-#define FASTRPC_CTXID_MASK (0xFF0)
 #define INIT_FILELEN_MAX (5 * 1024 * 1024)
 #define INIT_FILE_NAMELEN_MAX (128)
 #define FASTRPC_DEVICE_NAME	"fastrpc"
@@ -51,6 +52,82 @@
 #define SESSION_ID_MASK (1 << SESSION_ID_INDEX)
 #define MAX_FRPC_TGID 64
 #define COPY_BUF_WARN_LIMIT (512*1024)
+#define SMMU_4GB_ADDRESS_SPACE 0xFFFFFFFF
+#define SMMU_4K 0x1000
+#define SMMU_2M 0x200000
+#define SMMU_1G 0x40000000
+
+/*
+ * Align the size to next IOMMU page size
+ * for example 1MB gets aligned to 2MB, as
+ * IOMMU has only 3 page sizes 4K, 2M and 1G
+ */
+#define SMMU_ALIGN(size) ({		\
+	u64 align_size = 0;		\
+	if (size > SMMU_1G)		\
+		align_size = SMMU_1G;	\
+	else if (size > SMMU_2M)	\
+		align_size = SMMU_2M;	\
+	else				\
+		align_size = SMMU_4K;	\
+	ALIGN(size, align_size);	\
+})
+
+/*
+ * Default SMMU CB device index
+ * Used to log messages on this SMMU device
+ */
+#define DEFAULT_SMMU_IDX	0
+
+/*
+ * Fastrpc context ID bit-map:
+ *
+ * bits 0-3   : type of remote PD
+ * bit  4     : type of job (sync/async)
+ * bit  5     : reserved
+ * bits 6-15  : IDR id
+ * bits 16-63 : job id counter
+ */
+/* Starting position of idr in context id */
+#define FASTRPC_CTXID_IDR_POS  (6)
+
+/* Number of idr bits in context id */
+#define FASTRPC_CTXID_IDR_BITS (10)
+
+/* Max idr value */
+#define FASTRPC_CTX_MAX (1 << FASTRPC_CTXID_IDR_BITS)
+
+/* Bit-mask for idr */
+#define FASTRPC_CTXID_IDR_MASK (FASTRPC_CTX_MAX - 1)
+
+/* Macro to pack idr into context id  */
+#define FASTRPC_PACK_IDR_IN_CTXID(ctxid, idr) (ctxid | ((idr & \
+	FASTRPC_CTXID_IDR_MASK) << FASTRPC_CTXID_IDR_POS))
+
+/* Macro to extract idr from context id */
+#define FASTRPC_GET_IDR_FROM_CTXID(ctxid) ((ctxid >> FASTRPC_CTXID_IDR_POS) & \
+	FASTRPC_CTXID_IDR_MASK)
+
+/* Number of pd bits in context id (starting pos 0) */
+#define FASTRPC_CTXID_PD_BITS (4)
+
+/* Bit-mask for pd type */
+#define FASTRPC_CTXID_PD_MASK ((1 << FASTRPC_CTXID_PD_BITS) - 1)
+
+/* Macro to pack pd type into context id  */
+#define FASTRPC_PACK_PD_IN_CTXID(ctxid, pd) (ctxid | (pd & \
+		FASTRPC_CTXID_PD_MASK))
+
+/* Starting position of job id counter in context id */
+#define FASTRPC_CTXID_JOBID_POS (16)
+
+/* Macro to pack job id counter into context id  */
+#define FASTRPC_PACK_JOBID_IN_CTXID(ctxid, jobid) (ctxid | \
+		(jobid << FASTRPC_CTXID_JOBID_POS))
+
+/* Macro to extract ctxid (mask pd type) from response context */
+#define FASTRPC_GET_CTXID_FROM_RSP_CTX(rsp_ctx) (rsp_ctx & \
+		~FASTRPC_CTXID_PD_MASK)
 
 /* Maximum buffers cached in cached buffer list */
 #define FASTRPC_MAX_CACHED_BUFS (32)
@@ -132,9 +209,11 @@
  *     Page 1 : init-mem buf
  *     Page 2 : proc attrs debug buf
  *     Page 3 : rootheap buf
+ *     Page 4 : proc_init shared buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
+#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -169,6 +248,8 @@
 #define FASTRPC_DSPSIGNAL_TIMEOUT_NONE 0xffffffff
 #define FASTRPC_DSPSIGNAL_NUM_SIGNALS 1024
 #define FASTRPC_DSPSIGNAL_GROUP_SIZE 256
+/* Macro to return PDR status */
+#define IS_PDR(fl) (fl->spd && fl->spd->pdrcount != fl->spd->prevpdrcount)
 
 #define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   "audio_pdr_adsp"
 #define AUDIO_PDR_ADSP_SERVICE_NAME              "avs/audio"
@@ -183,8 +264,8 @@
 #define SLPI_SENSORPD_NAME                       "msm/slpi/sensor_pd"
 
 #define OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME   "ois_pdr_adsprpc"
-#define OIS_PDR_ADSP_SERVICE_NAME              "msm/adsp/ois_pd"
-#define ADSP_OISPD_NAME                        OIS_PDR_ADSP_SERVICE_NAME
+#define OIS_PDR_ADSP_SERVICE_NAME              "tms/servreg"
+#define ADSP_OISPD_NAME                        "msm/adsp/ois_pd"
 
 #define PERF_END ((void)0)
 
@@ -238,16 +319,17 @@
  * Process types on remote subsystem
  * Always add new PD types at the end, before MAX_PD_TYPE
  */
-#define DEFAULT_UNUSED    0  /* pd type not configured for context banks */
-#define ROOT_PD           1  /* Root PD */
-#define AUDIO_STATICPD    2  /* ADSP Audio Static PD */
-#define SENSORS_STATICPD  3  /* ADSP Sensors Static PD */
-#define SECURE_STATICPD   4  /* CDSP Secure Static PD */
-#define OIS_STATICPD      5  /* ADSP OIS Static PD */
-#define CPZ_USERPD        6  /* CDSP CPZ USER PD */
-#define USERPD            7  /* DSP User Dynamic PD */
-#define GUEST_OS_SHARED   8  /* Legacy Guest OS Shared */
-#define MAX_PD_TYPE       9  /* Max PD type */
+#define DEFAULT_UNUSED       0  /* pd type not configured for context banks */
+#define ROOT_PD              1  /* Root PD */
+#define AUDIO_STATICPD       2  /* ADSP Audio Static PD */
+#define SENSORS_STATICPD     3  /* ADSP Sensors Static PD */
+#define SECURE_STATICPD      4  /* CDSP Secure Static PD */
+#define OIS_STATICPD         5  /* ADSP OIS Static PD */
+#define CPZ_USERPD           6  /* CDSP CPZ USER PD */
+#define USERPD               7  /* DSP User Dynamic PD */
+#define GUEST_OS_SHARED      8  /* Legacy Guest OS Shared */
+#define USER_UNSIGNEDPD_POOL 9  /* DSP User Dynamic Unsigned PD pool */
+#define MAX_PD_TYPE          10 /* Max PD type */
 
 /* Attributes for internal purposes. Clients cannot query these */
 enum fastrpc_internal_attributes {
@@ -270,6 +352,13 @@ enum fastrpc_remote_domains_id {
 	USER_BUF,
 	REMOTEHEAP_BUF,
 	ROOTHEAP_BUF,
+};
+
+/* Types of RPC calls to DSP */
+enum fastrpc_msg_type {
+	USER_MSG = 0,
+	KERNEL_MSG_WITH_ZERO_PID,
+	KERNEL_MSG_WITH_NONZERO_PID,
 };
 
 enum fastrpc_response_flags {
@@ -443,6 +532,8 @@ struct fastrpc_buf {
 	struct fastrpc_user *fl;
 	struct dma_buf *dmabuf;
 	struct device *dev;
+	/* Context bank with which DMA buffer was allocated */
+	struct fastrpc_smmu *smmucb;
 	void *virt;
 	u32 type;
 	u64 phys;
@@ -453,6 +544,10 @@ struct fastrpc_buf {
 	uintptr_t raddr;
 	bool in_use;
 	u32 domain_id;
+	/* time counter to trace buffer allocation latency */
+	struct timespec64 alloc_time;
+	/* time counter to trace scm assign latency */
+	struct timespec64 scm_assign_time;
 };
 
 struct fastrpc_dma_buf_attachment {
@@ -468,6 +563,8 @@ struct fastrpc_map {
 	struct dma_buf *buf;
 	struct sg_table *table;
 	struct dma_buf_attachment *attach;
+	/* Context bank with which buffer was mapped on SMMU */
+	struct fastrpc_smmu *smmucb;
 	u64 phys;
 	u64 size;
 	void *va;
@@ -492,16 +589,10 @@ struct fastrpc_perf {
 	u64 tid;
 };
 
-struct fastrpc_session_ctx {
+struct fastrpc_smmu {
 	struct device *dev;
 	int sid;
-	int pd_type;
-	bool used;
 	bool valid;
-	bool secure;
-	bool sharedcb;
-	/* Completion object to let process cleanup before cleaning session */
-	struct completion cleanup;
 	struct mutex map_mutex;
 	/* gen pool for QRTR */
 	struct gen_pool *frpc_genpool;
@@ -511,6 +602,30 @@ struct fastrpc_session_ctx {
 	unsigned long genpool_iova;
 	/* fastrpc gen pool buffer size */
 	size_t genpool_size;
+	/* Total bytes allocated using this CB */
+	u64 allocatedbytes;
+	/* Total size of the context bank */
+	u64 totalbytes;
+	/* Min alloc size for which CB can be used */
+	u64 minallocsize;
+	/* Max alloc size for which CB can be used */
+	u64 maxallocsize;
+	/* To indentify the parent session this SMMU CB belomngs to */
+	struct fastrpc_pool_ctx *sess;
+};
+
+struct fastrpc_pool_ctx {
+	/* Context bank pool */
+	struct fastrpc_smmu smmucb[FASTRPC_MAX_CB_POOL];
+	u32 pd_type;
+	bool secure;
+	bool sharedcb;
+	/* Completion object to let process cleanup before cleaning session */
+	struct completion cleanup;
+	/* Number of context banks in the pool */
+	u32 smmucount;
+	/* Number of applications using the pool */
+	int usecount;
 };
 
 struct fastrpc_static_pd {
@@ -543,7 +658,7 @@ struct fastrpc_channel_ctx {
 	struct frpc_transport_session_control session_control;
 #endif
 	struct device *dev;
-	struct fastrpc_session_ctx session[FASTRPC_MAX_SESSIONS];
+	struct fastrpc_pool_ctx session[FASTRPC_MAX_SESSIONS];
 	struct fastrpc_static_pd spd[FASTRPC_MAX_SPD];
 	spinlock_t lock;
 	struct idr ctx_idr;
@@ -561,7 +676,7 @@ struct fastrpc_channel_ctx {
 	struct fastrpc_device_node *fdevice;
 	struct gid_list gidlist;
 	struct list_head gmaps;
-	struct fastrpc_rpmsg_log gmsg_log[FASTRPC_DEV_MAX];
+	struct fastrpc_rpmsg_log gmsg_log;
 	/* Secure subsystems like ADSP/SLPI will use secure client */
 	struct wakeup_source *wake_source_secure;
 	/* Non-secure subsystem like CDSP will use regular client */
@@ -577,6 +692,10 @@ struct fastrpc_channel_ctx {
 	atomic_t teardown;
 	/* Buffers donated to grow rootheap on DSP */
 	struct heap_bufs rootheap_bufs;
+	/* jobid counter to prepend into ctxid */
+	u64 jobid;
+	/* Flag to indicate CB pooling is enabled for channel */
+	bool smmucb_pool;
 };
 
 struct fastrpc_invoke_ctx {
@@ -588,6 +707,7 @@ struct fastrpc_invoke_ctx {
 	int pid;
 	int tgid;
 	u32 sc;
+	u32 handle;
 	u32 *crc;
 	/* user hint of completion time in us */
 	u32 early_wake_time;
@@ -620,8 +740,10 @@ struct fastrpc_device_node {
 };
 
 struct fastrpc_internal_config {
-	int init_fd;
-	int init_size;
+	int user_fd;
+	int user_size;
+	u64 root_addr;
+	u32 root_size;
 };
 
 /* FastRPC ioctl structure to set session related info */
@@ -654,6 +776,22 @@ struct fastrpc_notif_rsp {
 	enum fastrpc_status_flags status;
 };
 
+enum fastrpc_process_state {
+	/* Default state */
+	DEFAULT_PROC_STATE = 0,
+	/*
+	 * Process create on DSP initiated.
+	 * This state not being used at present.
+	 */
+	DSP_CREATE_START,
+	/* Process create on DSP complete */
+	DSP_CREATE_COMPLETE,
+	/* Process exit on DSP initiated */
+	DSP_EXIT_START,
+	/* Process exit on DSP complete */
+	DSP_EXIT_COMPLETE,
+};
+
 struct fastrpc_user {
 	struct list_head user;
 	struct list_head maps;
@@ -665,11 +803,13 @@ struct fastrpc_user {
 	struct list_head fastrpc_drivers;
 
 	struct fastrpc_channel_ctx *cctx;
-	struct fastrpc_session_ctx *sctx;
-	struct fastrpc_session_ctx *secsctx;
+	struct fastrpc_pool_ctx *sctx;
+	struct fastrpc_pool_ctx *secsctx;
 	struct fastrpc_buf *init_mem;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
+	/* proc_init shared buffer */
+	struct fastrpc_buf *proc_init_sharedbuf;
 	struct fastrpc_static_pd *spd;
 	/* Pre-allocated buffer divided into N chunks */
 	struct fastrpc_buf *hdr_bufs;
@@ -686,9 +826,8 @@ struct fastrpc_user {
 	int tgid;
 	/* Unique pid send to dsp*/
 	int tgid_frpc;
-	int pd;
-	/* Variable to identify process status*/
-	int file_close;
+	/* PD type of remote subsystem process */
+	u32 pd_type;
 	/* total cached buffers */
 	u32 num_cached_buf;
 	/* total persistent headers */
@@ -731,6 +870,8 @@ struct fastrpc_user {
 	bool multi_session_support;
 	bool untrusted_process;
 	bool set_session_info;
+	/* Various states throughout process life cycle */
+	enum fastrpc_process_state state;
 };
 
 struct fastrpc_ctrl_latency {
