@@ -1085,6 +1085,18 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 			 */
 			session->usecount++;
 			break;
+		} else if((isess->usecount == 0 || isess->smmucount > 1) &&
+ 			isess->smmucb[DEFAULT_SMMU_IDX].valid &&
+ 			isess->secure == secure &&
+                        (pd_type == USERPD && isess->pd_type == SENSORS_STATICPD && isess->usershare > 0)){
+			session = isess;
+						/*
+						 * Increment number of apps using session.
+						 * Will be max 1 for sessions that don't have
+						 * pooled context banks or a shared context bank.
+						 */
+						session->usecount++;
+						break;
 		}
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
@@ -5598,7 +5610,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_pool_ctx *sess = NULL;
 	struct device *dev = &pdev->dev;
-	int i, sessions = 0;
+	int i, sessions = 0, usershare = 0;
 	unsigned long flags;
 	u32 pd_type = DEFAULT_UNUSED, smmuidx = DEFAULT_SMMU_IDX;
 	int rc, err = 0;
@@ -5620,6 +5632,8 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 	of_property_read_u32(dev->of_node, "qcom,nsessions", &sessions);
+	of_property_read_u32(dev->of_node, "qcom,usershare", &usershare);
+        cctx->usershare = usershare;
 
 	if (of_get_property(dev->of_node, "pd-type", NULL) != NULL) {
 		err = of_property_read_u32(dev->of_node, "pd-type",
@@ -5660,6 +5674,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		sess->usecount = 0;
 		sess->pd_type = pd_type;
 	}
+        sess->usershare = usershare;
 	/* Read secure flag for each context bank, even if part of CB pool */
 	sess->secure = of_property_read_bool(dev->of_node,
 						"qcom,secure-context-bank");

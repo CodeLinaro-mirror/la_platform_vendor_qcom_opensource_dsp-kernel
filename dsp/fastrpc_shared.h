@@ -631,6 +631,7 @@ struct fastrpc_pool_ctx {
 	u32 pd_type;
 	bool secure;
 	bool sharedcb;
+        int usershare;
 	/* Number of context banks in the pool */
 	u32 smmucount;
 	/* Number of applications using the pool */
@@ -659,6 +660,7 @@ struct fastrpc_channel_ctx {
 	int domain_id;
 	int sesscount;
 	int vmcount;
+        int usershare;
 	u64 perms;
 	struct qcom_scm_vmperm vmperms[FASTRPC_MAX_VMIDS];
 #if !IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
