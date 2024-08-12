@@ -29,7 +29,6 @@
 #include <linux/cred.h>
 #include <linux/arch_topology.h>
 #include <linux/mem-buf.h>
-#include <linux/soc/qcom/pdr.h>
 #include <soc/qcom/secure_buffer.h>
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
