@@ -19,6 +19,10 @@
 #define FASTRPC_IOCTL_MULTIMODE_INVOKE	_IOWR('R', 12, struct fastrpc_ioctl_multimode_invoke)
 #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
 
+/* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
+#define FASTRPC_MDCTX_SETUP_RSVD 9
+#define FASTRPC_MDCTX_REMOVE_RSVD 8
+
 /**
  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
  * @FASTRPC_MAP_STATIC: Map memory pages with RW- permission and CACHE WRITEBACK.
@@ -93,7 +97,7 @@ struct fastrpc_enhanced_invoke {
 };
 
 struct fastrpc_ioctl_multimode_invoke {
-	__u32 req;
+	__u32 req;	/* enum fastrpc_multimode_invoke_type */
 	__u64 invparam;
 	__u64 size;
 	__u32 reserved[8];
@@ -108,6 +112,7 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_MULTISESSION = 6,
 	FASTRPC_INVOKE_CONFIG = 7,
 	FASTRPC_INVOKE_SESSIONINFO = 8,
+	FASTRPC_INVOKE_MDCTX_MANAGE,
 };
 
 struct fastrpc_init_create {
@@ -161,6 +166,49 @@ struct fastrpc_mem_unmap {
 	__u64 vaddr;		/* remote process (dsp) virtual address */
 	__u64 length;		/* buffer size */
 	__s32 reserved[5];
+};
+
+/* Types of context manage requests */
+enum fastrpc_mdctx_manage_req {
+	/* Setup multidomain context in kernel */
+	FASTRPC_MDCTX_SETUP,
+	/* Delete multidomain context in kernel */
+	FASTRPC_MDCTX_REMOVE,
+};
+
+/* Payload for FASTRPC_MDCTX_SETUP type */
+struct fastrpc_ioctl_mdctx_setup {
+	/* ctx id in userspace */
+	__u64 user_ctx;
+	/* User-addr to list of 32-bit domain ids */
+	__u64 domain_ids;
+	/* Number of domain ids */
+	__u32 num_domains;
+	/* User-addr where kernel copies unique 64-bit context id */
+	__u64 ctx;
+	__u32 reserved[FASTRPC_MDCTX_SETUP_RSVD];
+};
+
+/* Payload for FASTRPC_MDCTX_REMOVE type */
+struct fastrpc_ioctl_mdctx_remove {
+	/* kernel-generated context id */
+	__u64 ctx;
+	__u32 reserved[FASTRPC_MDCTX_REMOVE_RSVD];
+};
+
+/* Payload for FASTRPC_INVOKE_MDCTX_MANAGE type */
+struct fastrpc_ioctl_mdctx_manage {
+	/*
+	 * Type of ctx manage request.
+	 * One of "enum fastrpc_mdctx_manage_req"
+	 */
+	__u32 req;
+	/* To keep struct 64-bit aligned */
+	__u32 padding;
+	union {
+		struct fastrpc_ioctl_mdctx_setup setup;
+		struct fastrpc_ioctl_mdctx_remove remove;
+	};
 };
 
 enum fastrpc_control_type {

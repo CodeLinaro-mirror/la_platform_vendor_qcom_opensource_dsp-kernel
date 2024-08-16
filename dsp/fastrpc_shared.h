@@ -33,6 +33,9 @@
 #define FASTRPC_MAX_SESSIONS	14
 #define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
 
+/* Check if given domain id is valid */
+#define IS_VALID_DOMAIN_ID(domain) (domain < FASTRPC_DEV_MAX)
+
 /* Max number of SMMU context banks in a pool */
 #define FASTRPC_MAX_CB_POOL	7
 #define FASTRPC_MAX_SPD		4

@@ -38,11 +38,23 @@
 
 /* Struct to hold globally used variables */
 struct fastrpc_common {
-	/* global lock  to access channel context */
+	/*
+	 * use spin lock to protect global resources that are also accessed
+	 * in interrupt context
+	 */
 	spinlock_t glock;
+
+	/*
+	 * use mutex to protect global resources that will never be accessed
+	 * in interrupt context
+	 */
+	struct mutex gmut;
 
 	/* global copy of channel contexts */
 	struct fastrpc_channel_ctx *gctx[FASTRPC_DEV_MAX];
+
+	/* global list of multidomain context ids */
+	struct idr mdctx_idr;
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
@@ -3853,6 +3865,179 @@ static int fastrpc_set_session_info(
 	return 0;
 }
 
+/*
+ * Setup multidomain context in kernel
+ *
+ * For a multidomain context created in userspace, generate a unique
+ * context id in kernel.
+ *
+ * Also share the list of domains on which context was created to rootpd
+ * on dsp.
+ */
+static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_mdctx_setup *setup)
+{
+	int err = 0, ii = 0;
+	uint64_t ctx = 0;
+	struct mutex *gmut = &g_frpc.gmut;
+	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
+	struct device *dev = fl->cctx->dev;
+	uint32_t *domains = NULL;
+	size_t size = 0;
+	uint32_t num_domains = setup->num_domains, rsvd = 0,
+		max_domains = (FASTRPC_DEV_MAX * FASTRPC_MAX_SESSIONS_PER_PROCESS);
+
+	/* Validate that reserved fields are all zero */
+	for (ii = 0; ii < FASTRPC_MDCTX_SETUP_RSVD; ii++) {
+		rsvd = setup->reserved[ii];
+		if (rsvd) {
+			err = -EINVAL;
+			dev_err(dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
+				err, __func__, ii, rsvd);
+			return err;
+		}
+	}
+
+	/* Validate number of domains passed by user */
+	if (num_domains >= max_domains) {
+		err = -EINVAL;
+		dev_err(dev, "Error %d: %s: num domains %u more than max domains %u",
+			err, __func__, num_domains, max_domains);
+		goto bail;
+	}
+	size = sizeof(*domains) * num_domains;
+
+	/* Allocate local domains array to send to dsp */
+	domains = kzalloc(size, GFP_KERNEL);
+	if (!domains) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc domains array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+
+	/* Copy list of domains passed by user */
+	err = copy_from_user((void *)domains,
+			(void __user *)(uintptr_t)setup->domain_ids, size);
+	if (err) {
+		dev_err(dev, "Error %d: %s: failed to copy domain ids from user (size %zu)",
+			err, __func__, size);
+		err = -EFAULT;
+		goto bail;
+	}
+
+	/* Validate the domain ids */
+	for (ii = 0; ii < num_domains; ii++) {
+		if (!IS_VALID_DOMAIN_ID(domains[ii])) {
+			err = -EBADR;
+			dev_err(dev, "Error %d: %s: domain[%d of %u] %u is invalid\n",
+					err, __func__, ii, num_domains, domains[ii]);
+			goto bail;
+		}
+	}
+
+	/* Generate kernel context id */
+	mutex_lock(gmut);
+	err = idr_alloc_cyclic(mdctx_idr, fl, 1,
+				FASTRPC_CTX_MAX, GFP_ATOMIC);
+	mutex_unlock(gmut);
+
+	if (err < 0) {
+		dev_err(dev, "Error %d: %s: idr alloc failed", err, __func__);
+		goto bail;
+	}
+	ctx = (uint64_t)err;
+
+	/* Send context with peer info (i.e. domains list) to all dsps */
+
+	/* Copy context back to user */
+	err = copy_to_user((void __user *)setup->ctx, &ctx, sizeof(ctx));
+	if (err) {
+		dev_err(dev, "Error %d: %s: failed to copy ctx 0x%llx to user",
+			err, __func__, ctx);
+		err = -EFAULT;
+		goto bail;
+	}
+bail:
+	if (err && ctx) {
+		mutex_lock(gmut);
+		idr_remove(mdctx_idr, ctx);
+		mutex_unlock(gmut);
+	}
+
+	kfree(domains);
+	return err;
+}
+
+/*
+ * Release a multidomain context in kernel
+ *
+ * Also, send msg to dsp to release the same context
+ */
+static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_mdctx_remove *remove)
+{
+	struct device *dev = fl->cctx->dev;
+	struct mutex *gmut = &g_frpc.gmut;
+	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
+	struct fastrpc_user *tmp = NULL;
+	int err = 0, ii = 0, ctx = (int)remove->ctx;
+	uint32_t rsvd = 0;
+
+	/* Validate that reserved fields are zero */
+	for (ii = 0; ii < FASTRPC_MDCTX_REMOVE_RSVD; ii++) {
+		rsvd = remove->reserved[ii];
+		if (rsvd) {
+			err = -EINVAL;
+			dev_err(dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
+				err, __func__, ii, rsvd);
+			return err;
+		}
+	}
+
+	/* Deregister context from all dsps */
+
+	/* Release the context - if it was allocated to same client */
+	mutex_lock(gmut);
+	tmp = (struct fastrpc_user *)idr_find(mdctx_idr, ctx);
+	if (tmp != fl) {
+		/* App potentially trying to remove ctx of another client */
+		mutex_unlock(gmut);
+		err = -EACCES;
+		dev_err(dev, "Error %d: %s: attempting to remove ctx 0x%x of another app",
+			err, __func__, ctx);
+		return err;
+	}
+	idr_remove(mdctx_idr, ctx);
+	mutex_unlock(gmut);
+	return err;
+}
+
+/* Manage multi-domain context in kernel (register / remove) */
+static int fastrpc_multidomain_ctx_manage(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_mdctx_manage *ctxm)
+{
+	int err = 0;
+
+	/* Validate that padding fields are 0 */
+	if (ctxm->padding) {
+		err = -EINVAL;
+		return err;
+	}
+	switch (ctxm->req) {
+	case FASTRPC_MDCTX_SETUP:
+		err = fastrpc_multidomain_ctx_setup(fl, &ctxm->setup);
+		break;
+	case FASTRPC_MDCTX_REMOVE:
+		err = fastrpc_multidomain_ctx_remove(fl, &ctxm->remove);
+		break;
+	default:
+		err = -EBADRQC;
+		break;
+	}
+	return err;
+}
+
 static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
@@ -4100,6 +4285,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_internal_notif_rsp notif;
 	struct fastrpc_internal_config config;
 	struct fastrpc_internal_sessinfo sessinfo;
+	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	int err = 0;
@@ -4166,6 +4352,12 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			sizeof(struct fastrpc_internal_sessinfo)))
 			return -EFAULT;
 		err = fastrpc_set_session_info(fl, &sessinfo);
+		break;
+	case FASTRPC_INVOKE_MDCTX_MANAGE:
+		if (copy_from_user(&ctxm, (void __user *)(uintptr_t)invoke.invparam,
+			sizeof(ctxm)))
+			return -EFAULT;
+		err = fastrpc_multidomain_ctx_manage(fl, &ctxm);
 		break;
 	default:
 		err = -ENOTTY;
@@ -5942,6 +6134,8 @@ static int fastrpc_init(void)
 #endif
 
 	spin_lock_init(&g_frpc.glock);
+	mutex_init(&g_frpc.gmut);
+	idr_init(&g_frpc.mdctx_idr);
 	ret = platform_driver_register(&fastrpc_cb_driver);
 	if (ret < 0) {
 		pr_err("fastrpc: failed to register cb driver\n");
@@ -5971,6 +6165,8 @@ module_init(fastrpc_init);
 static void fastrpc_exit(void)
 {
 	platform_driver_unregister(&fastrpc_cb_driver);
+	idr_destroy(&g_frpc.mdctx_idr);
+	mutex_destroy(&g_frpc.gmut);
 	fastrpc_transport_deinit();
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove_recursive(g_frpc.debugfs_root);
