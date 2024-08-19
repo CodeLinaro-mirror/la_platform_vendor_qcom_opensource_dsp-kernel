@@ -89,7 +89,8 @@ struct fastrpc_enhanced_invoke {
 	__u64 crc;
 	__u64 perf_kernel;
 	__u64 perf_dsp;
-	__u32 reserved[20];
+	__u32 priority;
+	__u32 reserved[19];
 };
 
 struct fastrpc_ioctl_multimode_invoke {

@@ -235,6 +235,32 @@
 #define FASTRPC_CPUINFO_DEFAULT (0)
 #define FASTRPC_CPUINFO_EARLY_WAKEUP (1)
 
+/* Position of priority in frpc tid for glink msg packet */
+#define PRIORITY_POS_IN_FRPC_TID 26
+
+/* Bit-mask to retain only priority bits of tid  */
+#define FRPC_TID_PRIO_MASK (~((1UL << PRIORITY_POS_IN_FRPC_TID) - 1))
+
+/**
+ * Macro to generate frpc thread id based on priority and hlos thread id
+ *
+ * TID breakdown:
+ *		bits 0-25  : actual HLOS thread id
+ *		bits 26-31 : priority of rpc call
+ */
+#define GENERATE_FRPC_TID_WITH_PRIORITY(tid, priority) \
+			(tid | (priority << PRIORITY_POS_IN_FRPC_TID))
+
+/**
+ * Macro to validate if bits in priority positions of original HLOS tid
+ * aren't already non-zero.
+ * Returns:
+ *      false if the any of the bits are set
+ *      true otherwise
+ */
+#define VALIDATE_PRIORITY_BITS_IN_TID(tid) \
+		(((tid & FRPC_TID_PRIO_MASK) == 0) ? true : false)
+
 /* Maximum PM timeout that can be voted through fastrpc */
 #define FASTRPC_MAX_PM_TIMEOUT_MS 50
 #define FASTRPC_NON_SECURE_WAKE_SOURCE_CLIENT_NAME	"fastrpc-non_secure"
