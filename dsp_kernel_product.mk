@@ -6,9 +6,6 @@ ifeq ($(TARGET_KERNEL_DLKM_DISABLE), true)
 	endif
 endif
 
-ifeq ($(FASTRPC_DLKM_ENABLED), true)
-PRODUCT_PACKAGES += frpc-adsprpc.ko
-ifeq ($(TARGET_BOARD_PLATFORM), niobe)
-PRODUCT_PACKAGES += cdsp-loader.ko
-endif
-endif
+#ifeq ($(FASTRPC_DLKM_ENABLED), true)
+#PRODUCT_PACKAGES += frpc-adsprpc.ko
+#endif

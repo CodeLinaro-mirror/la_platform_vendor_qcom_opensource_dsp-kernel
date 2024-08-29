@@ -37,15 +37,18 @@ KBUILD_CPPFLAGS += -DCONFIG_DSP_MONACO=1
 ccflags-y += -DCONFIG_DSP_MONACO=1
 endif
 
+ifeq ($(CONFIG_ARCH_CANOE), y)
+$(info within KBUILD file CONFIG_ARCH_CANOE = $(CONFIG_ARCH_CANOE))
+KBUILD_CPPFLAGS += -CONFIG_DSP_CANOE=1
+ccflags-y += -CONFIG_DSP_CANOE=1
+endif
+
 LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 
 frpc-adsprpc-y := dsp/fastrpc.o	\
 			 dsp/fastrpc_rpmsg.o \
 
-cdsp-loader-y := dsp/cdsp-loader.o
-
-obj-m := frpc-adsprpc.o cdsp-loader.o
+obj-m := frpc-adsprpc.o
 
 BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/frpc-adsprpc.ko
-#BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/cdsp-loader.ko

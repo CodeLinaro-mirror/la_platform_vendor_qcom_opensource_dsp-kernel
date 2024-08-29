@@ -32,3 +32,7 @@ define_modules("monaco", "gki")
 define_modules("parrot", "consolidate")
 
 define_modules("parrot", "gki")
+
+define_modules("canoe", "gki")
+
+define_modules("canoe", "consolidate")
