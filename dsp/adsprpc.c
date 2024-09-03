@@ -952,6 +952,8 @@ static int fastrpc_mmap_remove(struct fastrpc_file *fl, int fd, uintptr_t va,
 			map->refs == 1 &&
 			/* Remove map only if it isn't being used in any pending RPC calls */
 			!map->ctx_refs &&
+			/* Remove map only if it isn't being used by DSP */
+			!map->dma_handle_refs &&
 			/* Skip unmap if it is fastrpc shell memory */
 			!map->is_filemap) {
 			match = map;
@@ -991,8 +993,9 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 	if (map->flags == ADSP_MMAP_HEAP_ADDR ||
 				map->flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 		spin_lock_irqsave(&me->hlock, irq_flags);
-		map->refs--;
-		if (!map->refs && !map->is_persistent && !map->ctx_refs)
+		if (map->refs)
+			map->refs--;
+		if (!map->refs && !map->is_persistent)
 			hlist_del_init(&map->hn);
 		if (map->refs > 0) {
 			ADSPRPC_WARN(
@@ -1005,10 +1008,14 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 			map->in_use = false;
 		spin_unlock_irqrestore(&me->hlock, irq_flags);
 	} else {
-		map->refs--;
-		if (!map->refs && !map->ctx_refs)
+		if (map->refs)
+			map->refs--;
+		/* flags is passed as 1 during fastrpc_file_free (ie process exit),
+		 * so that maps will be cleared even though references are present.
+		 */
+		if (flags || (!map->refs && !map->ctx_refs && !map->dma_handle_refs))
 			hlist_del_init(&map->hn);
-		if (map->refs > 0 && !flags)
+		else
 			return;
 	}
 	if (map->flags == ADSP_MMAP_HEAP_ADDR ||
@@ -2484,21 +2491,22 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		if (err) {
 			for (j = bufs; j < i; j++) {
 				/*
-				 * Due to error decrement ctx refs count before mmap free
+				 * Due to error decrement  refs count before mmap free
 				 * for each in/out handle, if map created
 				 */
-				if (ctx->maps[j] && ctx->maps[j]->ctx_refs)
-					ctx->maps[j]->ctx_refs--;
-				fastrpc_mmap_free(ctx->maps[j], 0);
+				if (ctx->maps[j] && ctx->maps[j]->dma_handle_refs) {
+					ctx->maps[j]->dma_handle_refs--;
+					fastrpc_mmap_free(ctx->maps[j], 0);
+				}
 			}
 			mutex_unlock(&ctx->fl->map_mutex);
 			goto bail;
 		} else if (ctx->maps[i]) {
 			/*
-			 * Increment ctx refs count for in/out handle if map created
+			 * Increment  refs count for in/out handle if map created
 			 * and no error, indicate map under use in remote call
 			 */
-			ctx->maps[i]->ctx_refs++;
+			ctx->maps[i]->dma_handle_refs++;
 		}
 		ipage += 1;
 	}
@@ -2639,14 +2647,33 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		rpra[i].buf.pv = buf;
 	}
 	PERF_END);
+	/* Since we are not holidng map_mutex during get args whole time
+	 * it is possible that dma handle map may be removed by some invalid
+	 * fd passed by DSP. Inside the lock check if the map present or not
+	 */
+	mutex_lock(&ctx->fl->map_mutex);
 	for (i = bufs; i < bufs + handles; ++i) {
-		struct fastrpc_mmap *map = ctx->maps[i];
+		struct fastrpc_mmap *mmap = NULL;
+		/* check if map  was created */
+		if (ctx->maps[i]) {
+			/* check if map still exist */
+			if (!fastrpc_mmap_find(ctx->fl, ctx->fds[i], NULL, 0, 0,
+				0, 0, &mmap)) {
+				if (mmap) {
+					pages[i].addr = mmap->phys;
+					pages[i].size = mmap->size;
+				}
 
-		if (map) {
-			pages[i].addr = map->phys;
-			pages[i].size = map->size;
+			} else {
+				/* map already freed by some other call */
+				mutex_unlock(&ctx->fl->map_mutex);
+				ADSPRPC_ERR("could not find map associated with dma hadle fd %d \n",
+					ctx->fds[i]);
+				goto bail;
+			}
 		}
 	}
+	mutex_unlock(&ctx->fl->map_mutex);
 	fdlist = (uint64_t *)&pages[bufs + handles];
 	crclist = (uint32_t *)&fdlist[M_FDLIST];
 	/* reset fds, crc and early wakeup hint memory */
@@ -2855,9 +2882,10 @@ static int put_args(uint32_t kernel, struct smq_invoke_ctx *ctx,
 			 * Decrement ctx refs count before mmap free,
 			 * indicate remote call no longer using it
 			 */
-			if (mmap && mmap->ctx_refs)
-				mmap->ctx_refs--;
-			fastrpc_mmap_free(mmap, 0);
+			if (mmap && mmap->dma_handle_refs) {
+				mmap->dma_handle_refs = 0;
+				fastrpc_mmap_free(mmap, 0);
+			}
 		}
 	}
 	mutex_unlock(&ctx->fl->map_mutex);
@@ -4010,7 +4038,7 @@ bail:
 static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 				struct fastrpc_ioctl_init_attrs *uproc)
 {
-	int err = 0, memlen = 0, mflags = 0, locked = 0;
+	int err = 0, memlen = 0, mflags = 0, locked = 0, glocked = 0;
 	struct fastrpc_ioctl_invoke_async ioctl;
 	struct fastrpc_ioctl_init *init = &uproc->init;
 	 /* First page for init-mem and second page for proc-attrs */
@@ -4024,6 +4052,8 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 	unsigned int dsp_userpd_memlen = 0;
 	struct fastrpc_buf *init_mem;
 	struct fastrpc_mmap *sharedbuf_map = NULL;
+	struct fastrpc_apps *me = &gfa;
+	unsigned long irq_flags = 0;
 
 	struct {
 		int pgid;
@@ -4128,20 +4158,6 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 		ADSPRPC_ERR("donated memory allocated in userspace\n");
 		goto bail;
 	}
-	/* Free any previous donated memory */
-	spin_lock(&fl->hlock);
-	locked = 1;
-	if (fl->init_mem) {
-		init_mem = fl->init_mem;
-		fl->init_mem = NULL;
-		spin_unlock(&fl->hlock);
-		locked = 0;
-		fastrpc_buf_free(init_mem, 0);
-	}
-	if (locked) {
-		spin_unlock(&fl->hlock);
-		locked = 0;
-	}
 
 	/* Allocate DMA buffer in kernel for donating to remote process
 	 * Unsigned PD requires additional memory because of the
@@ -4245,12 +4261,20 @@ bail:
 	if (err) {
 		ADSPRPC_ERR("failed with err %d\n", err);
 		fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
+		spin_unlock(&fl->hlock);
+		locked = 0;
+		spin_lock_irqsave(&me->hlock, irq_flags);
+		glocked = 1;
 		if (!IS_ERR_OR_NULL(fl->init_mem)) {
 			init_mem = fl->init_mem;
 			fl->init_mem = NULL;
-			spin_unlock(&fl->hlock);
-			locked = 0;
+			spin_unlock_irqrestore(&me->hlock, irq_flags);
+			glocked = 0;
 			fastrpc_buf_free(init_mem, 0);
+		}
+		if (glocked) {
+			spin_unlock_irqrestore(&me->hlock, irq_flags);
+			glocked = 0;
 		}
 	} else {
 		fl->dsp_process_state = PROCESS_CREATE_SUCCESS;
@@ -5931,6 +5955,7 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 	unsigned long irq_flags = 0;
 	bool is_locked = false;
 	int i;
+	struct fastrpc_buf *init_mem = NULL;
 
 	if (!fl)
 		return 0;
@@ -6002,8 +6027,22 @@ skip_dump_wait:
 	wake_up_interruptible(&fl->proc_state_notif.notif_wait_queue);
 	spin_unlock_irqrestore(&fl->proc_state_notif.nqlock, flags);
 
-	if (!IS_ERR_OR_NULL(fl->init_mem))
-		fastrpc_buf_free(fl->init_mem, 0);
+	if (!is_locked) {
+		spin_lock_irqsave(&fl->apps->hlock, irq_flags);
+		is_locked = true;
+	}
+	if (!IS_ERR_OR_NULL(fl->init_mem)) {
+		init_mem = fl->init_mem;
+		fl->init_mem = NULL;
+		is_locked = false;
+		spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
+		fastrpc_buf_free(init_mem, 0);
+	}
+	if (is_locked) {
+		is_locked = false;
+		spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
+	}
+
 	fastrpc_context_list_dtor(fl);
 	fastrpc_cached_buf_list_free(fl);
 	if (!IS_ERR_OR_NULL(fl->hdr_bufs))
