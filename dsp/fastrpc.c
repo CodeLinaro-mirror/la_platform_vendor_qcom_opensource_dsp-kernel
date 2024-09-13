@@ -1765,8 +1765,8 @@ static inline int fastrpc_getpd_msgidx(u32 pd_type) {
 }
 
 static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
-			       struct fastrpc_invoke_ctx *ctx,
-			       u32 kernel, uint32_t handle)
+				u32 priority, struct fastrpc_invoke_ctx *ctx,
+				u32 kernel, uint32_t handle)
 {
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
@@ -1776,6 +1776,23 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	cctx = fl->cctx;
 	msg->pid = fl->tgid_frpc;
 	msg->tid = current->pid;
+	if (priority) {
+		/**
+		 * RPC calls from same hlos thread made at different priorities need to be
+		 * enqueued to different dsp threads. So, fastrpc driver will need to send
+		 * modified tid's for different priorities.
+		 *
+		 * This is done by encoding the priority with the actual tid.
+		 * If any of the priority bits are set in the base TID,
+		 * then fail the call immediately as those bits cannot be overwritten.
+		 */
+		if (!VALIDATE_PRIORITY_BITS_IN_TID(msg->tid)) {
+			dev_err(fl->cctx->dev, "Error: %s: priority bits in tid %d are non-zero (prio %u)",
+				__func__, msg->tid, priority);
+			return -EFAULT;
+		}
+		msg->tid = GENERATE_FRPC_TID_WITH_PRIORITY(msg->tid, priority);
+	}
 
 	if (kernel == KERNEL_MSG_WITH_ZERO_PID)
 		msg->pid = 0;
@@ -1955,6 +1972,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	u64 *perf_counter = NULL;
 	struct timespec64 invoket = {0};
 	struct device *dev = NULL;
+	u32 priority = invoke->priority;
 
 	if (atomic_read(&fl->cctx->teardown))
 		return -EPIPE;
@@ -2016,7 +2034,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_LINK),
-	err = fastrpc_invoke_send(fl->sctx, ctx, kernel, handle);
+	err = fastrpc_invoke_send(fl->sctx, priority, ctx, kernel, handle);
 	if (err)
 		goto bail;
 	PERF_END);
