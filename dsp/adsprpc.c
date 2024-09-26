@@ -4030,6 +4030,12 @@ static int fastrpc_init_attach_process(struct fastrpc_file *fl,
 			"untrusted app trying to attach to privileged DSP PD\n");
 		return err;
 	}
+
+	/* Return an error if the create process already started or completed */
+	if (atomic_cmpxchg(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT,
+			PROCESS_CREATE_IS_INPROGRESS) != PROCESS_CREATE_DEFAULT)
+		return -EALREADY;
+
 	/*
 	 * Prepare remote arguments for creating thread group
 	 * in guestOS/staticPD on the remote subsystem.
@@ -4054,8 +4060,11 @@ static int fastrpc_init_attach_process(struct fastrpc_file *fl,
 		fl->pd = FASTRPC_SENSORS_PD;
 
 	err = fastrpc_internal_invoke(fl, FASTRPC_MODE_PARALLEL, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
-	if (err)
+	if (err) {
+		atomic_set(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT);
 		goto bail;
+	}
+	atomic_set(&fl->dsp_process_state, PROCESS_CREATE_SUCCESS);
 bail:
 	return err;
 }
@@ -4094,15 +4103,14 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 		int siglen;
 	} inbuf;
 
-	spin_lock(&fl->hlock);
-	if (fl->dsp_process_state) {
-		err = -EALREADY;
+	/* Return an error if the create process already started or completed */
+	if (atomic_cmpxchg(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT,
+			PROCESS_CREATE_IS_INPROGRESS) != PROCESS_CREATE_DEFAULT) {
 		ADSPRPC_ERR("Already in create dynamic process\n");
-		spin_unlock(&fl->hlock);
-		return err;
+		return -EALREADY;
 	}
-	fl->dsp_process_state = PROCESS_CREATE_IS_INPROGRESS;
 
+	spin_lock(&fl->hlock);
 	if (init->memlen) {
 		if(init->memlen > INIT_MEMLEN_MAX_DYNAMIC || init->memlen < INIT_MEMLEN_MIN_DYNAMIC) {
 		    ADSPRPC_ERR(
@@ -4290,7 +4298,7 @@ bail:
 	locked = 1;
 	if (err) {
 		ADSPRPC_ERR("failed with err %d\n", err);
-		fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
+		atomic_set(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT);
 		spin_unlock(&fl->hlock);
 		locked = 0;
 		spin_lock_irqsave(&me->hlock, irq_flags);
@@ -4307,7 +4315,7 @@ bail:
 			glocked = 0;
 		}
 	} else {
-		fl->dsp_process_state = PROCESS_CREATE_SUCCESS;
+		atomic_set(&fl->dsp_process_state, PROCESS_CREATE_SUCCESS);
 	}
 	if (locked) {
 		spin_unlock(&fl->hlock);
@@ -4348,6 +4356,12 @@ static int fastrpc_init_create_static_process(struct fastrpc_file *fl,
 			"untrusted app trying to attach to audio PD\n");
 		return err;
 	}
+
+	/* Return an error if the create process already started or completed */
+	if (atomic_cmpxchg(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT,
+			PROCESS_CREATE_IS_INPROGRESS) != PROCESS_CREATE_DEFAULT)
+		return -EALREADY;
+
 	VERIFY(err, init->memlen <= INIT_MEMLEN_MAX_STATIC);
 	if (err) {
 		ADSPRPC_ERR(
@@ -4479,9 +4493,11 @@ static int fastrpc_init_create_static_process(struct fastrpc_file *fl,
 	err = fastrpc_internal_invoke(fl, FASTRPC_MODE_PARALLEL, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err)
 		goto bail;
+	atomic_set(&fl->dsp_process_state, PROCESS_CREATE_SUCCESS);
 bail:
 	kfree(proc_name);
 	if (err) {
+		atomic_set(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT);
 		me->staticpd_flags = 0;
 		if (rh_hyp_done) {
 			int hyp_err = 0;
@@ -6025,7 +6041,7 @@ skip_dmainvoke_wait:
 	}
 	hlist_del_init(&fl->hn);
 	fl->is_dma_invoke_pend = false;
-	fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
+	atomic_set(&fl->dsp_process_state, PROCESS_CREATE_DEFAULT);
 	is_locked = false;
 	spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
 
@@ -6523,7 +6539,6 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	fl->init_mem = NULL;
 	fl->qos_request = 0;
 	fl->dsp_proc_init = 0;
-	fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
 	fl->is_unsigned_pd = false;
 	fl->exit_notif = false;
 	fl->exit_async = false;
