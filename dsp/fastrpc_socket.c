@@ -17,6 +17,7 @@ struct fastrpc_channel_ctx *scctx = NULL;
 
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
+	int err = 0;
 	if (scctx)
 		return scctx;
 
@@ -25,6 +26,9 @@ struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 		dev_err(dev, "failed to get channel ctx\n");
 		return ERR_PTR(-ENOMEM);
 	}
+
+	err = of_property_read_u32(dev->of_node, "qcom,dsp-iova-format",
+			&scctx->iova_format);
 
 	scctx->domain_id = CDSP_DOMAIN_ID;
 	atomic_set(&scctx->teardown, 0);
