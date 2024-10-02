@@ -619,6 +619,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 	int i, j;
 
 	cctx = container_of(ref, struct fastrpc_channel_ctx, refcount);
+	fastrpc_channel_default_user_delete(cctx);
 	mutex_destroy(&cctx->wake_mutex);
 
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++)
@@ -3263,10 +3264,23 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	return;
 }
 
-static int fastrpc_device_release(struct inode *inode, struct file *file)
+/*
+ * Free fastrpc user object of client
+ *
+ * @arg1 : file (NULL for default channel user)
+ * @arg2 : channel context (NULL for user-apps, non-NULL for default user)
+ *
+ * This function deletes a fastrpc user object:
+ *		- 	for a user-app when it closes the fastrpc device node
+ *		- 	when a remote channel goes thru ssr and its default user needs
+ *			to be removed
+ *
+ * Returns 0 if user object is successfully removed
+ */
+static int fastrpc_user_obj_free(struct file *file,
+	struct fastrpc_channel_ctx *cctx)
 {
-	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
-	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_user *fl = NULL;
 	struct fastrpc_driver *frpc_drv, *d;
 	struct fastrpc_buf *buf, *b;
 	int i;
@@ -3274,6 +3288,21 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	bool locked = false, is_driver_registered = false;
 	spinlock_t *glock = &g_frpc.glock;
 	int err = 0;
+
+	if (file) {
+		fl = (struct fastrpc_user *)file->private_data;
+		cctx = fl->cctx;
+	} else {
+		fl = (struct fastrpc_user *)cctx->default_user;
+		if (!fl)
+			return -EINVAL;
+
+		/*
+		 * Most of the cleanup done for user objects of regular user-apps
+		 * can be skipped for the channel's default user object.
+		 */
+		goto skip_user_cleanup;
+	}
 
 	spin_lock_irqsave(glock, irq_flags);
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3362,8 +3391,6 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 
 	fl->is_dma_invoke_pend = false;
 
-	fastrpc_free_user(fl);
-
 	/*
 	 * Audio remote-heap buffers won't be freed as part of "fastrpc_user" object
 	 * cleanup. Instead, they will be freed after SSR dump collection.
@@ -3396,30 +3423,77 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove(fl->debugfs_file);
 #endif
+
+skip_user_cleanup:
+	fastrpc_free_user(fl);
+
 	mutex_destroy(&fl->signal_create_mutex);
 	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
-	spin_lock_irqsave(glock, irq_flags);
 	kfree(fl);
 
-	fastrpc_channel_update_invoke_cnt(cctx, false);
+	if (file) {
+		spin_lock_irqsave(glock, irq_flags);
+		fastrpc_channel_update_invoke_cnt(cctx, false);
+		spin_unlock_irqrestore(glock, irq_flags);
 
-	fastrpc_channel_ctx_put(cctx);
-	file->private_data = NULL;
-	spin_unlock_irqrestore(glock, irq_flags);
+		fastrpc_channel_ctx_put(cctx);
+		file->private_data = NULL;
+	} else {
+		/*
+		 * Default user-object will be deleted only when the last
+		 * reference to the channel-ctx object is removed. So there is no
+		 * need to update invoke count to synchronize with ssr callback.
+		 */
+		cctx->default_user = NULL;
+	}
 	return 0;
 }
 
-static int fastrpc_device_open(struct inode *inode, struct file *filp)
+/*
+ * Callback function that will be invoked when user-app closes the
+ * fastrpc device node.
+ *
+ * This functions cleans up the user-object of the app.
+ */
+static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
-	struct fastrpc_channel_ctx *cctx;
+	return fastrpc_user_obj_free(file, NULL);
+}
+
+/* Remove default user object when the channel context is freed */
+int fastrpc_channel_default_user_delete(struct fastrpc_channel_ctx *cctx)
+{
+	return fastrpc_user_obj_free(NULL, cctx);
+}
+
+/*
+ * Create fastrpc user object for a client
+ *
+ * @arg1 : file (NULL for default user)
+ * @arg2 : channel context (NULL for user-apps, non-NULL for default user)
+ *
+ * This function creates a fastrpc user object:
+ *		- 	for a user-app when it opens the fastrpc device node
+ *		- 	when a remote channel comes up and its default user needs to
+ *			be set up
+ *
+ * The user object for an application will be added to the channel's
+ * user-list.
+ *
+ * Returns 0 if user object is successfully created
+ */
+static int fastrpc_user_obj_create(struct file *filp,
+	struct fastrpc_channel_ctx *cctx) {
 	struct fastrpc_device_node *fdevice;
 	struct fastrpc_user *fl = NULL;
 	unsigned long flags;
 	int err;
 
-	fdevice = miscdev_to_fdevice(filp->private_data);
-	cctx = fdevice->cctx;
+	if (filp) {
+		fdevice = miscdev_to_fdevice(filp->private_data);
+		cctx = fdevice->cctx;
+	}
 
 	if (atomic_read(&cctx->teardown))
 		return -EPIPE;
@@ -3428,10 +3502,13 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	if (!fl)
 		return -ENOMEM;
 
-	/* Released in fastrpc_device_release() */
-	fastrpc_channel_ctx_get(cctx);
+	if (filp) {
+		/* Released in fastrpc_device_release() */
+		fastrpc_channel_ctx_get(cctx);
 
-	filp->private_data = fl;
+		filp->private_data = fl;
+	}
+
 	spin_lock_init(&fl->lock);
 	mutex_init(&fl->remote_map_mutex);
 	mutex_init(&fl->map_mutex);
@@ -3450,36 +3527,51 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	init_completion(&fl->dma_invoke);
 
 	fl->cctx = cctx;
-	fl->tgid = current->tgid;
-	fl->tgid_frpc = get_unique_hlos_process_id(cctx);
 	fl->state = DEFAULT_PROC_STATE;
-
-	if (fl->tgid_frpc == -1) {
-		dev_err(cctx->dev, "too many fastrpc clients, max %u allowed\n", MAX_FRPC_TGID);
-		err = -EUSERS;
-		goto error;
-	}
-	dev_dbg(cctx->dev, "HLOS pid %d, domain %d is mapped to unique sessions pid %d",
-			fl->tgid, fl->cctx->domain_id, fl->tgid_frpc);
-	fl->is_secure_dev = fdevice->secure;
-	fl->sessionid = 0;
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
-	fl->multi_session_support = false;
-	fl->set_session_info = false;
 
-	if (cctx->lowest_capacity_core_count) {
-		fl->dev_pm_qos_req = kzalloc((cctx->lowest_capacity_core_count) *
-				sizeof(struct dev_pm_qos_request), GFP_KERNEL);
-		if (!fl->dev_pm_qos_req) {
-			err = -ENOMEM;
+	if (filp) {
+		fl->tgid = current->tgid;
+		fl->tgid_frpc = get_unique_hlos_process_id(cctx);
+
+		if (fl->tgid_frpc == -1) {
+			dev_err(cctx->dev, "too many fastrpc clients, max %u allowed\n",
+									MAX_FRPC_TGID);
+			err = -EUSERS;
 			goto error;
 		}
-	}
+		dev_dbg(cctx->dev, "HLOS pid %d, domain %d is mapped to unique sessions pid %d",
+				fl->tgid, fl->cctx->domain_id, fl->tgid_frpc);
+		fl->is_secure_dev = fdevice->secure;
 
-	spin_lock_irqsave(&cctx->lock, flags);
-	list_add_tail(&fl->user, &cctx->users);
-	spin_unlock_irqrestore(&cctx->lock, flags);
+		if (cctx->lowest_capacity_core_count) {
+			fl->dev_pm_qos_req = kzalloc((cctx->lowest_capacity_core_count) *
+					sizeof(struct dev_pm_qos_request), GFP_KERNEL);
+			if (!fl->dev_pm_qos_req) {
+				err = -ENOMEM;
+				goto error;
+			}
+		}
+
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_add_tail(&fl->user, &cctx->users);
+		spin_unlock_irqrestore(&cctx->lock, flags);
+	} else {
+		/* No pid will be associated with the default user-object */
+		fl->tgid = -1;
+		fl->tgid_frpc = -1;
+
+		/*
+		 * RPC calls made with the channel's default user-object will
+		 * always use the context bank reserved for rootpd.
+		 */
+		err = fastrpc_get_root_session(cctx, &fl->sctx);
+		if (err)
+			goto error;
+
+		cctx->default_user = fl;
+	}
 
 	return 0;
 error:
@@ -3487,9 +3579,34 @@ error:
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->signal_create_mutex);
 	kfree(fl);
-	fastrpc_channel_ctx_put(cctx);
+	if (filp)
+		fastrpc_channel_ctx_put(cctx);
 
 	return err;
+}
+
+/*
+ * Callback function that will be invoked when user-object opens the
+ * fastrpc device node
+ *
+ * This function creates the user-object for the app.
+ */
+static int fastrpc_device_open(struct inode *inode, struct file *filp)
+{
+	return fastrpc_user_obj_create(filp, NULL);
+}
+
+/*
+ * Create the default user object for a remote channel
+ *
+ * The default user object will be created for a remote channel when it
+ * comes up. It is required for kernel-to-rootpd rpc communication.
+ *
+ * Returns 0 if user object was created successfully
+ */
+int fastrpc_channel_default_user_create(struct fastrpc_channel_ctx *cctx)
+{
+	return fastrpc_user_obj_create(NULL, cctx);
 }
 
 static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
@@ -3910,7 +4027,7 @@ static int fastrpc_set_session_info(
  * on dsp.
  */
 static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
-	struct fastrpc_ioctl_mdctx_setup *setup)
+	uint32_t req, struct fastrpc_ioctl_mdctx_setup *setup)
 {
 	int err = 0, ii = 0;
 	uint64_t ctx = 0;
@@ -3975,15 +4092,17 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	mutex_lock(gmut);
 	err = idr_alloc_cyclic(mdctx_idr, fl, 1,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);
-	mutex_unlock(gmut);
 
 	if (err < 0) {
+		mutex_unlock(gmut);
 		dev_err(dev, "Error %d: %s: idr alloc failed", err, __func__);
 		goto bail;
 	}
 	ctx = (uint64_t)err;
 
 	/* Send context with peer info (i.e. domains list) to all dsps */
+
+	mutex_unlock(gmut);
 
 	/* Copy context back to user */
 	err = copy_to_user((void __user *)setup->ctx, &ctx, sizeof(ctx));
@@ -4010,7 +4129,7 @@ bail:
  * Also, send msg to dsp to release the same context
  */
 static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
-	struct fastrpc_ioctl_mdctx_remove *remove)
+	uint32_t req, struct fastrpc_ioctl_mdctx_remove *remove)
 {
 	struct device *dev = fl->cctx->dev;
 	struct mutex *gmut = &g_frpc.gmut;
@@ -4030,20 +4149,21 @@ static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
 		}
 	}
 
-	/* Deregister context from all dsps */
-
 	/* Release the context - if it was allocated to same client */
 	mutex_lock(gmut);
 	tmp = (struct fastrpc_user *)idr_find(mdctx_idr, ctx);
 	if (tmp != fl) {
 		/* App potentially trying to remove ctx of another client */
-		mutex_unlock(gmut);
 		err = -EACCES;
 		dev_err(dev, "Error %d: %s: attempting to remove ctx 0x%x of another app",
 			err, __func__, ctx);
-		return err;
+		goto bail;
 	}
+
+	/* Deregister context from all dsps */
+
 	idr_remove(mdctx_idr, ctx);
+bail:
 	mutex_unlock(gmut);
 	return err;
 }
@@ -4061,10 +4181,10 @@ static int fastrpc_multidomain_ctx_manage(struct fastrpc_user *fl,
 	}
 	switch (ctxm->req) {
 	case FASTRPC_MDCTX_SETUP:
-		err = fastrpc_multidomain_ctx_setup(fl, &ctxm->setup);
+		err = fastrpc_multidomain_ctx_setup(fl, ctxm->req, &ctxm->setup);
 		break;
 	case FASTRPC_MDCTX_REMOVE:
-		err = fastrpc_multidomain_ctx_remove(fl, &ctxm->remove);
+		err = fastrpc_multidomain_ctx_remove(fl, ctxm->req, &ctxm->remove);
 		break;
 	default:
 		err = -EBADRQC;

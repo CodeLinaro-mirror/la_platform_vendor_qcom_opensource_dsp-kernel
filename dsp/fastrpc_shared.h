@@ -45,8 +45,6 @@
 #define FASTRPC_MAX_CRCLIST	64
 #define FASTRPC_KERNEL_PERF_LIST (PERF_KEY_MAX)
 #define FASTRPC_DSP_PERF_LIST 12
-#define FASTRPC_INIT_HANDLE	1
-#define FASTRPC_DSP_UTILITIES_HANDLE	2
 #define FASTRPC_MAX_STATIC_HANDLE (20)
 #define INIT_FILELEN_MAX (5 * 1024 * 1024)
 #define INIT_FILE_NAMELEN_MAX (128)
@@ -195,17 +193,6 @@
 
 #define FASTRPC_CREATE_PROCESS_NARGS	6
 #define FASTRPC_CREATE_STATIC_PROCESS_NARGS	3
-/* Remote Method id table */
-#define FASTRPC_RMID_INIT_ATTACH	0
-#define FASTRPC_RMID_INIT_RELEASE	1
-#define FASTRPC_RMID_INIT_MMAP		4
-#define FASTRPC_RMID_INIT_MUNMAP	5
-#define FASTRPC_RMID_INIT_CREATE	6
-#define FASTRPC_RMID_INIT_CREATE_ATTR	7
-#define FASTRPC_RMID_INIT_CREATE_STATIC	8
-#define FASTRPC_RMID_INIT_MEM_MAP      10
-#define FASTRPC_RMID_INIT_MEM_UNMAP    11
-#define FASTRPC_RMID_INIT_MAX (20)
 
 /*
  * Num of pages shared with process spawn call.
@@ -382,6 +369,26 @@ enum fastrpc_cb_pd_types {
 	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
 	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
 	MAX_PD_TYPE,                    /* Max PD type */
+};
+
+/* List of const remote handles used by framework only */
+enum fastrpc_internal_remote_handles {
+	FASTRPC_INIT_HANDLE = 1,
+	FASTRPC_DSP_UTILITIES_HANDLE = 2,
+};
+
+/* List of method ids associated with process group const handle*/
+enum fastrpc_process_method_ids {
+	FASTRPC_RMID_INIT_ATTACH        = 0,
+	FASTRPC_RMID_INIT_RELEASE       = 1,
+	FASTRPC_RMID_INIT_MMAP          = 4,
+	FASTRPC_RMID_INIT_MUNMAP        = 5,
+	FASTRPC_RMID_INIT_CREATE        = 6,
+	FASTRPC_RMID_INIT_CREATE_ATTR   = 7,
+	FASTRPC_RMID_INIT_CREATE_STATIC = 8,
+	FASTRPC_RMID_INIT_MEM_MAP       = 10,
+	FASTRPC_RMID_INIT_MEM_UNMAP     = 11,
+	FASTRPC_RMID_INIT_MAX,
 };
 
 /* Attributes for internal purposes. Clients cannot query these */
@@ -754,6 +761,8 @@ struct fastrpc_channel_ctx {
 	wait_queue_head_t ssr_wait_queue;
 	/* Format to control where sid is prepended to iova */
 	u32 iova_format;
+	/* Default user object for making kernel-to-rootpd rpc calls */
+	struct fastrpc_user *default_user;
 };
 
 struct fastrpc_invoke_ctx {
@@ -999,6 +1008,12 @@ int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx
 				bool is_secured, const char *domain);
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev);
 void fastrpc_notify_users(struct fastrpc_user *user);
+
+/* Create default user object for remote channel */
+int fastrpc_channel_default_user_create(struct fastrpc_channel_ctx *cctx);
+
+/* Remove default user object for remote channel */
+int fastrpc_channel_default_user_delete(struct fastrpc_channel_ctx *cctx);
 
 /* Function to clean all SMMU mappings associated with a fastrpc user obj */
 void fastrpc_free_user(struct fastrpc_user *fl);

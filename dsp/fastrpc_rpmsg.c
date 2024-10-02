@@ -188,12 +188,19 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 			FASTRPC_SECURE_WAKE_SOURCE_CLIENT_NAME, &data->wake_source_secure);
 	mutex_unlock(&data->wake_mutex);
 
+	err = fastrpc_channel_default_user_create(data);
+	if (err)
+		goto fdev_error;
+
 	fastrpc_update_gctx(data, 1);
 
 	dev_info(rdev, "Opened rpmsg channel for %s", domain);
 	return 0;
 
 fdev_error:
+	if (data->default_user)
+		fastrpc_channel_default_user_delete(data);
+
 	kfree(data);
 
 populate_error:
