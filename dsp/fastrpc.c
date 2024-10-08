@@ -96,6 +96,12 @@ void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag)
 		*ctx = NULL;
 }
 
+/* Get channel ctx object for given domain id */
+static inline struct fastrpc_channel_ctx
+	*fastrpc_get_domain_channel_ctx(int domain_id)
+{
+	return g_frpc.gctx[domain_id];
+}
 
 static void dma_buf_unmap_attachment_wrap(struct fastrpc_map *map)
 {
@@ -4027,36 +4033,100 @@ static int fastrpc_set_session_info(
 	return 0;
 }
 
-/*
- * Setup multidomain context in kernel
- *
- * For a multidomain context created in userspace, generate a unique
- * context id in kernel.
- *
- * Also share the list of domains on which context was created to rootpd
- * on dsp.
- */
-static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
-	uint32_t req, struct fastrpc_ioctl_mdctx_setup *setup)
+/* Get fastrpc tgid of given session on given domain */
+static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
+	int32_t *tgid_frpc)
+{
+	int err = 0;
+	bool found = false;
+	struct fastrpc_channel_ctx *cctx = NULL;
+	struct fastrpc_user *user = NULL;
+
+	cctx = fastrpc_get_domain_channel_ctx(domain);
+	if (!cctx) {
+		/* Channel is going thru ssr */
+		err = -EPIPE;
+		goto bail;
+	}
+	fastrpc_channel_ctx_get(cctx);
+	if (atomic_read(&cctx->teardown)) {
+		/* If subsystem already going thru SSR, fail immediately */
+		err = -EPIPE;
+		goto bail;
+	}
+	fastrpc_channel_update_invoke_cnt(cctx, true);
+
+	/*
+	 * Search for user objects of current process on remote channel
+	 * corresponding to given domain & find object of given session
+	 */
+	list_for_each_entry(user, &cctx->users, user) {
+		if (user->tgid == current->tgid && user->sessionid == session) {
+			*tgid_frpc = user->tgid_frpc;
+			found = true;
+			break;
+		}
+	}
+
+	if (!found)
+		err = -ESRCH;
+	fastrpc_channel_update_invoke_cnt(cctx, false);
+bail:
+	fastrpc_channel_ctx_put(cctx);
+	return err;
+}
+
+/* Helper function to get frpc tgid of each session of context */
+static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
+	struct fastrpc_mdctx_info *mdctx)
 {
 	int err = 0, ii = 0;
-	uint64_t ctx = 0;
-	struct mutex *gmut = &g_frpc.gmut;
-	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
-	struct device *dev = fl->cctx->dev;
-	uint32_t *domains = NULL;
-	size_t size = 0;
-	uint32_t num_domains = setup->num_domains, rsvd = 0,
+	uint32_t domain = 0, session = 0, num_domains = mdctx->num_domains;
+
+	for (ii = 0; ii < num_domains; ii++) {
+		domain = mdctx->domains[ii];
+		session = mdctx->session_ids[ii];
+
+		if (!IS_VALID_DOMAIN_ID(domain) || !IS_VALID_SESSION_ID(session)) {
+			err = -EBADR;
+			dev_err(dev, "Error %d: %s: [%u of %u]: domain %u or session %u is invalid",
+					err, __func__, ii, num_domains, domain, session);
+			break;
+		}
+
+		err = fastrpc_get_frpc_tgid(domain, session,
+					&mdctx->tgids_frpc[ii]);
+		if (err) {
+			dev_err(dev, "Error %d: %s: [%d of %d]: unable to get frpc tgid for domain %u, session %u",
+							err, __func__, ii, num_domains, domain, session);
+			break;
+		}
+	}
+	return err;
+}
+
+/* Helper function to initialize multidomain context object */
+static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_mdctx_manage *ctxm,
+	struct fastrpc_mdctx_info **o_mdctx)
+{
+	int err = 0, ii = 0;
+	uint32_t rsvd = 0, num_domains = ctxm->num_domains,
 		max_domains = (FASTRPC_DEV_MAX * FASTRPC_MAX_SESSIONS_PER_PROCESS);
+	struct device *dev = fl->cctx->dev;
+	size_t size = 0;
+	uint32_t *domains = NULL, *session_ids = NULL;
+	int32_t *tgids_frpc = NULL;
+	struct fastrpc_mdctx_info *mdctx = NULL;
 
 	/* Validate that reserved fields are all zero */
-	for (ii = 0; ii < FASTRPC_MDCTX_SETUP_RSVD; ii++) {
-		rsvd = setup->reserved[ii];
+	for (ii = 0; ii < FASTRPC_MDCTX_IOCTL_RSVD; ii++) {
+		rsvd = ctxm->reserved[ii];
 		if (rsvd) {
 			err = -EINVAL;
 			dev_err(dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
 				err, __func__, ii, rsvd);
-			return err;
+			goto bail;
 		}
 	}
 
@@ -4065,6 +4135,14 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 		err = -EINVAL;
 		dev_err(dev, "Error %d: %s: num domains %u more than max domains %u",
 			err, __func__, num_domains, max_domains);
+		goto bail;
+	}
+
+	mdctx = kzalloc(sizeof(*mdctx), GFP_KERNEL);
+	if (!mdctx) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc mdctx obj",
+			err, __func__);
 		goto bail;
 	}
 	size = sizeof(*domains) * num_domains;
@@ -4080,7 +4158,7 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 
 	/* Copy list of domains passed by user */
 	err = copy_from_user((void *)domains,
-			(void __user *)(uintptr_t)setup->domain_ids, size);
+			(void __user *)(uintptr_t)ctxm->domain_ids, size);
 	if (err) {
 		dev_err(dev, "Error %d: %s: failed to copy domain ids from user (size %zu)",
 			err, __func__, size);
@@ -4088,19 +4166,217 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 		goto bail;
 	}
 
-	/* Validate the domain ids */
+	/* Allocate local sessions array */
+	session_ids = kzalloc(size, GFP_KERNEL);
+	if (!session_ids) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc sessions array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+
+	/* Copy list of session ids passed by user */
+	err = copy_from_user((void *)session_ids,
+			(void __user *)(uintptr_t)ctxm->session_ids, size);
+	if (err) {
+		dev_err(dev, "Error %d: %s: failed to copy session ids from user (size %zu)",
+			err, __func__, size);
+		err = -EFAULT;
+		goto bail;
+	}
+
+	/* Allocate tgids array to send to dsp */
+	size = sizeof(*tgids_frpc) * num_domains;
+	tgids_frpc = kzalloc(size, GFP_KERNEL);
+	if (!tgids_frpc) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc tgids array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+	mdctx->num_domains = num_domains;
+	mdctx->domains = domains;
+	mdctx->session_ids = session_ids;
+	mdctx->tgids_frpc = tgids_frpc;
+
+	err = fastrpc_multidomain_ctx_get_tgids(dev, mdctx);
+	if (err)
+		goto bail;
+
+	*o_mdctx = mdctx;
+bail:
+	if (err) {
+		kfree(tgids_frpc);
+		kfree(session_ids);
+		kfree(domains);
+		kfree(mdctx);
+	}
+	return err;
+}
+
+/* Helper function to make rpc call to dsp root to reg / dereg ctx */
+static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
+	uint32_t req, uint64_t ctx, uint32_t id,
+	struct fastrpc_mdctx_info *mdctx, uint32_t num_domains)
+{
+	int err = 0;
+	struct fastrpc_enhanced_invoke invoke = {0};
+	struct fastrpc_invoke_args args[4] = {0};
+	struct {
+		u32 req;
+		u32 pad;
+		u64 ctx;
+		u32 id;
+		u32 num_domains;
+		u32 num_tgids;
+		u32 rsvd_len;
+	} inargs = {0};
+
+	fastrpc_channel_ctx_get(cctx);
+	if (atomic_read(&cctx->teardown)) {
+		/* If subsystem already going thru SSR, fail immediately */
+		err = -EPIPE;
+		goto bail;
+	}
+	fastrpc_channel_update_invoke_cnt(cctx, true);
+
+	/* Convert logical domain ids to physical ids */
+
+	/* Prepare args for kernel to rootpd rpc call */
+	inargs.req = req;
+	inargs.ctx = ctx;
+	inargs.id = id;
+	inargs.num_tgids = num_domains;
+	inargs.num_domains = num_domains;
+
+	args[0].ptr = (u64)(uintptr_t)&inargs;
+	args[0].length = sizeof(inargs);
+	args[0].fd = -1;
+
+	/* This should be list of physical domain ids */
+	args[1].ptr = (u64)(uintptr_t)mdctx->domains;
+	args[1].length = num_domains * sizeof(*(mdctx->domains));
+	args[1].fd = -1;
+
+	args[2].ptr = (u64)(uintptr_t)mdctx->tgids_frpc;
+	args[2].length = num_domains * sizeof(*(mdctx->tgids_frpc));
+	args[2].fd = -1;
+
+	invoke.inv.handle = FASTRPC_INIT_HANDLE;
+	invoke.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_MDCTX_MANAGE, 4, 0);
+	invoke.inv.args = (__u64)args;
+
+	err = fastrpc_internal_invoke(cctx->default_user,
+					KERNEL_MSG_WITH_ZERO_PID, &invoke);
+	fastrpc_channel_update_invoke_cnt(cctx, false);
+bail:
+	fastrpc_channel_ctx_put(cctx);
+	return err;
+}
+
+/*
+ * Send multidomain context to dsp with peer information
+ *
+ * Context will be registered with peer-information / deregistered with
+ * the resource manager on dsp.
+ * Peer-info should be list of dsp instance ids (which is a HW configured
+ * parameter). This is different from the dsp domain ids.
+ */
+static int fastrpc_multidomain_ctx_dsp_manage(struct fastrpc_user *fl,
+	uint32_t req, uint64_t ctx, struct fastrpc_mdctx_info *mdctx,
+	uint32_t num_domains)
+{
+	int err = 0, ii = 0;
+	uint32_t domain = 0;
+	struct fastrpc_channel_ctx *cctx = NULL;
+	struct device *dev = fl->cctx->dev;
+
+	/* Make rpc call to rootpd */
 	for (ii = 0; ii < num_domains; ii++) {
-		if (!IS_VALID_DOMAIN_ID(domains[ii])) {
-			err = -EBADR;
-			dev_err(dev, "Error %d: %s: domain[%d of %u] %u is invalid\n",
-					err, __func__, ii, num_domains, domains[ii]);
-			goto bail;
+		domain = mdctx->domains[ii];
+
+		/*
+		 * If a context has been created on multiple sessions on same dsp,
+		 * make register / deregister call only once to that dsp.
+		 */
+		if (ii > 0 && domain == mdctx->domains[0])
+			break;
+
+		cctx = fastrpc_get_domain_channel_ctx(domain);
+		if (!cctx) {
+			if (req == FASTRPC_MDCTX_REMOVE) {
+				/*
+				 * In case of context deregister request, even if one of
+				 * the domains is going thru ssr, the ctx still needs to
+				 * be deregistered from the other domains.
+				 */
+				continue;
+			} else {
+				/* Channel is going thru ssr */
+				err = -EPIPE;
+				dev_err(dev,
+					"Error %d: %s: remote channel is down for domain[%d of %d] %u",
+					err, __func__, ii + 1, num_domains, domain);
+				goto bail;
+			}
+		}
+		err = fastrpc_multidomain_ctx_dsp_send(cctx, req, ctx, ii, mdctx,
+						num_domains);
+		if (err) {
+			if (req == FASTRPC_MDCTX_REMOVE) {
+				/*
+				 * In case of context deregister request, even if it fails
+				 * on one of the domains, the ctx still needs to be
+				 * deregistered from the other domains.
+				 */
+				continue;
+			} else {
+				dev_err(dev,
+					"Error 0x%x: %s: failed to register ctx on domain[%d of %d] %u",
+					err, __func__, ii + 1, num_domains, domain);
+				goto bail;
+			}
 		}
 	}
+bail:
+	if (err && req == FASTRPC_MDCTX_SETUP) {
+		/*
+		 * In case of a context registration request failing on one of
+		 * the dsps, the context needs to be deregistered from all dsps
+		 * where the registration was successful.
+		 */
+		fastrpc_multidomain_ctx_dsp_manage(fl, FASTRPC_MDCTX_REMOVE,
+											ctx, mdctx, ii);
+	}
+	return err;
+}
+
+/*
+ * Setup multidomain context in kernel
+ *
+ * For a multidomain context created in userspace, generate a unique
+ * context id in kernel.
+ *
+ * Also share the list of domains on which context was created to rootpd
+ * on dsp.
+ */
+static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_mdctx_manage *ctxm)
+{
+	int err = 0;
+	uint64_t ctx = 0;
+	struct mutex *gmut = &g_frpc.gmut;
+	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
+	struct device *dev = fl->cctx->dev;
+	struct fastrpc_mdctx_info *mdctx = NULL;
+
+	err = fastrpc_multidomain_ctx_obj_init(fl, ctxm, &mdctx);
+	if (err)
+		return err;
 
 	/* Generate kernel context id */
 	mutex_lock(gmut);
-	err = idr_alloc_cyclic(mdctx_idr, fl, 1,
+	err = idr_alloc_cyclic(mdctx_idr, mdctx, 1,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);
 
 	if (err < 0) {
@@ -4111,25 +4387,39 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	ctx = (uint64_t)err;
 
 	/* Send context with peer info (i.e. domains list) to all dsps */
+	err = fastrpc_multidomain_ctx_dsp_manage(fl, ctxm->req, ctx, mdctx,
+				mdctx->num_domains);
+	if (err) {
+		mutex_unlock(gmut);
+		dev_err(dev, "Error 0x%x: %s: peer-info register failed",
+			err, __func__);
+		goto bail;
+	}
 
 	mutex_unlock(gmut);
 
 	/* Copy context back to user */
-	err = copy_to_user((void __user *)setup->ctx, &ctx, sizeof(ctx));
+	err = copy_to_user((void __user *)ctxm->ctx, &ctx, sizeof(ctx));
 	if (err) {
 		dev_err(dev, "Error %d: %s: failed to copy ctx 0x%llx to user",
 			err, __func__, ctx);
 		err = -EFAULT;
 		goto bail;
 	}
+	mdctx->ctx = ctx;
+	mdctx->fl = fl;
 bail:
-	if (err && ctx) {
-		mutex_lock(gmut);
-		idr_remove(mdctx_idr, ctx);
-		mutex_unlock(gmut);
+	if (err) {
+		if (ctx) {
+			mutex_lock(gmut);
+			idr_remove(mdctx_idr, ctx);
+			mutex_unlock(gmut);
+		}
+		kfree(mdctx->tgids_frpc);
+		kfree(mdctx->session_ids);
+		kfree(mdctx->domains);
+		kfree(mdctx);
 	}
-
-	kfree(domains);
 	return err;
 }
 
@@ -4139,18 +4429,18 @@ bail:
  * Also, send msg to dsp to release the same context
  */
 static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
-	uint32_t req, struct fastrpc_ioctl_mdctx_remove *remove)
+	struct fastrpc_ioctl_mdctx_manage *ctxm)
 {
 	struct device *dev = fl->cctx->dev;
 	struct mutex *gmut = &g_frpc.gmut;
 	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
-	struct fastrpc_user *tmp = NULL;
-	int err = 0, ii = 0, ctx = (int)remove->ctx;
+	int err = 0, ii = 0, ctx = (int)ctxm->ctx;
 	uint32_t rsvd = 0;
+	struct fastrpc_mdctx_info *mdctx = NULL;
 
-	/* Validate that reserved fields are zero */
-	for (ii = 0; ii < FASTRPC_MDCTX_REMOVE_RSVD; ii++) {
-		rsvd = remove->reserved[ii];
+	/* Validate that reserved fields are all zero */
+	for (ii = 0; ii < FASTRPC_MDCTX_IOCTL_RSVD; ii++) {
+		rsvd = ctxm->reserved[ii];
 		if (rsvd) {
 			err = -EINVAL;
 			dev_err(dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
@@ -4161,8 +4451,8 @@ static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
 
 	/* Release the context - if it was allocated to same client */
 	mutex_lock(gmut);
-	tmp = (struct fastrpc_user *)idr_find(mdctx_idr, ctx);
-	if (tmp != fl) {
+	mdctx = (struct fastrpc_mdctx_info *)idr_find(mdctx_idr, ctx);
+	if (!mdctx || mdctx->ctx != ctxm->ctx || mdctx->fl != fl) {
 		/* App potentially trying to remove ctx of another client */
 		err = -EACCES;
 		dev_err(dev, "Error %d: %s: attempting to remove ctx 0x%x of another app",
@@ -4171,8 +4461,19 @@ static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
 	}
 
 	/* Deregister context from all dsps */
+	err = fastrpc_multidomain_ctx_dsp_manage(fl, ctxm->req, ctx, mdctx,
+				mdctx->num_domains);
+	if (err) {
+		dev_err(dev, "Error 0x%x: %s: peer-info deregister failed",
+			err, __func__);
+		goto bail;
+	}
 
 	idr_remove(mdctx_idr, ctx);
+	kfree(mdctx->tgids_frpc);
+	kfree(mdctx->session_ids);
+	kfree(mdctx->domains);
+	kfree(mdctx);
 bail:
 	mutex_unlock(gmut);
 	return err;
@@ -4184,17 +4485,12 @@ static int fastrpc_multidomain_ctx_manage(struct fastrpc_user *fl,
 {
 	int err = 0;
 
-	/* Validate that padding fields are 0 */
-	if (ctxm->padding) {
-		err = -EINVAL;
-		return err;
-	}
 	switch (ctxm->req) {
 	case FASTRPC_MDCTX_SETUP:
-		err = fastrpc_multidomain_ctx_setup(fl, ctxm->req, &ctxm->setup);
+		err = fastrpc_multidomain_ctx_setup(fl, ctxm);
 		break;
 	case FASTRPC_MDCTX_REMOVE:
-		err = fastrpc_multidomain_ctx_remove(fl, ctxm->req, &ctxm->remove);
+		err = fastrpc_multidomain_ctx_remove(fl, ctxm);
 		break;
 	default:
 		err = -EBADRQC;

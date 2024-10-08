@@ -20,8 +20,7 @@
 #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
 
 /* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
-#define FASTRPC_MDCTX_SETUP_RSVD 9
-#define FASTRPC_MDCTX_REMOVE_RSVD 8
+#define FASTRPC_MDCTX_IOCTL_RSVD 8
 
 /**
  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
@@ -179,26 +178,6 @@ enum fastrpc_mdctx_manage_req {
 	FASTRPC_MDCTX_REMOVE,
 };
 
-/* Payload for FASTRPC_MDCTX_SETUP type */
-struct fastrpc_ioctl_mdctx_setup {
-	/* ctx id in userspace */
-	__u64 user_ctx;
-	/* User-addr to list of 32-bit domain ids */
-	__u64 domain_ids;
-	/* Number of domain ids */
-	__u32 num_domains;
-	/* User-addr where kernel copies unique 64-bit context id */
-	__u64 ctx;
-	__u32 reserved[FASTRPC_MDCTX_SETUP_RSVD];
-};
-
-/* Payload for FASTRPC_MDCTX_REMOVE type */
-struct fastrpc_ioctl_mdctx_remove {
-	/* kernel-generated context id */
-	__u64 ctx;
-	__u32 reserved[FASTRPC_MDCTX_REMOVE_RSVD];
-};
-
 /* Payload for FASTRPC_INVOKE_MDCTX_MANAGE type */
 struct fastrpc_ioctl_mdctx_manage {
 	/*
@@ -206,12 +185,21 @@ struct fastrpc_ioctl_mdctx_manage {
 	 * One of "enum fastrpc_mdctx_manage_req"
 	 */
 	__u32 req;
-	/* To keep struct 64-bit aligned */
-	__u32 padding;
-	union {
-		struct fastrpc_ioctl_mdctx_setup setup;
-		struct fastrpc_ioctl_mdctx_remove remove;
-	};
+	/* ctx id in userspace */
+	__u64 user_ctx;
+	/* User-addr to list of domains on which context is being managed */
+	__u64 domain_ids;
+	/* User-addr to list of domains on which context is being managed */
+	__u64 session_ids;
+	/* Number of domain ids */
+	__u32 num_domains;
+	/*
+	 * ctx setup req  : user-addr where unique 64-bit context generated
+	 *                  by kernel is copied to
+	 * ctx remove req : ctx id to be removed
+	 */
+	__u64 ctx;
+	__u32 reserved[FASTRPC_MDCTX_IOCTL_RSVD];
 };
 
 enum fastrpc_control_type {

@@ -36,6 +36,9 @@
 /* Check if given domain id is valid */
 #define IS_VALID_DOMAIN_ID(domain) (domain < FASTRPC_DEV_MAX)
 
+/* Check if given session id is valid */
+#define IS_VALID_SESSION_ID(sess) (sess < FASTRPC_MAX_SESSIONS_PER_PROCESS)
+
 /* Max number of SMMU context banks in a pool */
 #define FASTRPC_MAX_CB_POOL	7
 #define FASTRPC_MAX_SPD		4
@@ -391,6 +394,7 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_CREATE_STATIC = 8,
 	FASTRPC_RMID_INIT_MEM_MAP       = 10,
 	FASTRPC_RMID_INIT_MEM_UNMAP     = 11,
+	FASTRPC_RMID_INIT_MDCTX_MANAGE  = 12,
 	FASTRPC_RMID_INIT_MAX,
 };
 
@@ -820,6 +824,21 @@ struct fastrpc_device_node {
 	struct fastrpc_channel_ctx *cctx;
 	struct miscdevice miscdev;
 	bool secure;
+};
+
+struct fastrpc_mdctx_info {
+	/* List of domains on which context was created */
+	uint32_t *domains;
+	/* List of session ids on each domain */
+	uint32_t *session_ids;
+	/* List of fastrpc-assigned tgids of each session */
+	int32_t *tgids_frpc;
+	/* Number of domains */
+	uint32_t num_domains;
+	/* User-obj using which context was created */
+	struct fastrpc_user *fl;
+	/* Kernel generated context id */
+	uint64_t ctx;
 };
 
 struct fastrpc_internal_config {
