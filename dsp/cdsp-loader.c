@@ -13,6 +13,7 @@
 #include <linux/of_device.h>
 #include <linux/sysfs.h>
 #include <linux/remoteproc.h>
+#include <linux/version.h>
 
 #define BOOT_CMD 1
 #define IMAGE_UNLOAD_CMD 0
@@ -218,7 +219,11 @@ error_return:
 	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+static void cdsp_loader_remove(struct platform_device *pdev)
+#else
 static int cdsp_loader_remove(struct platform_device *pdev)
+#endif
 {
 	struct cdsp_loader_private *priv = NULL;
 
@@ -239,7 +244,9 @@ static int cdsp_loader_remove(struct platform_device *pdev)
 		priv->boot_cdsp_obj = NULL;
 	}
 
-	return 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
+        return 0;
+#endif
 }
 
 static int cdsp_loader_probe(struct platform_device *pdev)

@@ -38,19 +38,10 @@ def define_modules(target, variant):
         ],
     )
 
-    ddk_module(
-        name = "{}_cdsp-loader".format(kernel_build_variant),
-        kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
-        deps = ["//msm-kernel:all_headers"],
-        srcs = ["dsp/cdsp-loader.c"],
-        out = "cdsp-loader.ko",
-    )
-
     copy_to_dist_dir(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
         data = [
             ":{}_frpc-adsprpc".format(kernel_build_variant),
-            ":{}_cdsp-loader".format(kernel_build_variant),
         ],
         dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
         flat = True,
