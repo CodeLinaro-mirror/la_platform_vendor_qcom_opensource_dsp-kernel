@@ -827,6 +827,8 @@ struct fastrpc_device_node {
 };
 
 struct fastrpc_mdctx_info {
+	/* Node to add to process multidomain context list */
+	struct list_head node;
 	/* List of domains on which context was created */
 	uint32_t *domains;
 	/* List of session ids on each domain */
@@ -903,6 +905,9 @@ struct fastrpc_user {
 	struct list_head cached_bufs;
 	/* list of client drivers registered to fastrpc driver*/
 	struct list_head fastrpc_drivers;
+
+	/* List of multidomain contexts created using this user */
+	struct list_head mdctxs;
 
 	struct fastrpc_channel_ctx *cctx;
 
