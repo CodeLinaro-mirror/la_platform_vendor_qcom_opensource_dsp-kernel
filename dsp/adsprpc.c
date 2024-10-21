@@ -1894,7 +1894,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 	}
 
 	if (invokefd->fds) {
-		K_COPY_FROM_USER(err, kernel, ctx->fds, invokefd->fds,
+		K_COPY_FROM_USER(err, kernel_msg, ctx->fds, invokefd->fds,
 						bufs * sizeof(*ctx->fds));
 		if (err) {
 			ADSPRPC_ERR(
@@ -1907,7 +1907,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 		ctx->fds = NULL;
 	}
 	if (invokefd->attrs) {
-		K_COPY_FROM_USER(err, kernel, ctx->attrs, invokefd->attrs,
+		K_COPY_FROM_USER(err, kernel_msg, ctx->attrs, invokefd->attrs,
 						bufs * sizeof(*ctx->attrs));
 		if (err) {
 			ADSPRPC_ERR(
@@ -1952,7 +1952,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 		ctx->perf->tid = fl->tgid;
 	}
 	if (invokefd->job) {
-		K_COPY_FROM_USER(err, kernel, &ctx->asyncjob, invokefd->job,
+		K_COPY_FROM_USER(err, kernel_msg, &ctx->asyncjob, invokefd->job,
 						sizeof(ctx->asyncjob));
 		if (err)
 			goto bail;
@@ -3924,7 +3924,7 @@ int fastrpc_internal_invoke2(struct fastrpc_file *fl,
 			err = -EBADE;
 			goto bail;
 		}
-		K_COPY_FROM_USER(err, is_compat, &p.user_concurrency,
+		K_COPY_FROM_USER(err, 0, &p.user_concurrency,
 				(void *)inv2->invparam, size);
 		if (err)
 			goto bail;
@@ -6029,16 +6029,8 @@ skip_dmainvoke_wait:
 	is_locked = false;
 	spin_unlock_irqrestore(&fl->apps->hlock, irq_flags);
 
-	if (!fl->sctx) {
-		spin_lock_irqsave(&me->hlock, irq_flags);
-		/* Reset the tgid usage to false */
-		if (fl->tgid_frpc != -1)
-			frpc_tgid_usage_array[fl->tgid_frpc] = false;
-		spin_unlock_irqrestore(&me->hlock, irq_flags);
-		kfree(fl);
-		fl = NULL;
-		return;
-	}
+	if (!fl->sctx)
+		goto bail;
 
 	//Dummy wake up to exit Async worker thread
 	spin_lock_irqsave(&fl->aqlock, flags);
@@ -6092,23 +6084,22 @@ skip_dmainvoke_wait:
 	if (fl->device && is_driver_closed)
 		device_unregister(&fl->device->dev);
 
-	spin_lock_irqsave(&me->hlock, irq_flags);
-	/* Reset the tgid usage to false */
-	if (fl->tgid_frpc != -1)
-		frpc_tgid_usage_array[fl->tgid_frpc] = false;
-	spin_unlock_irqrestore(&me->hlock, irq_flags);
-
 	VERIFY(err, VALID_FASTRPC_CID(cid));
 	if (!err && fl->sctx)
 		fastrpc_session_free(&fl->apps->channel[cid], fl->sctx);
 	if (!err && fl->secsctx)
 		fastrpc_session_free(&fl->apps->channel[cid], fl->secsctx);
-
 	for (i = 0; i < (DSPSIGNAL_NUM_SIGNALS / DSPSIGNAL_GROUP_SIZE); i++)
 		kfree(fl->signal_groups[i]);
-	mutex_destroy(&fl->signal_create_mutex);
-
 	fastrpc_remote_buf_list_free(fl);
+
+bail:
+	spin_lock_irqsave(&me->hlock, irq_flags);
+	/* Reset the tgid usage to false */
+	if (fl->tgid_frpc != -1)
+		frpc_tgid_usage_array[fl->tgid_frpc] = false;
+	spin_unlock_irqrestore(&me->hlock, irq_flags);
+	mutex_destroy(&fl->signal_create_mutex);
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->internal_map_mutex);
 	kfree(fl->dev_pm_qos_req);
@@ -6248,7 +6239,7 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 	} else {
 		ret = fastrpc_file_get(fl);
 		if (ret) {
-			ADSPRPC_ERR("Failed to get user process reference for fl (%pK)\n", fl);
+			ADSPRPC_ERR("Failed to get user process reference\n");
 			goto bail;
 		}
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
@@ -6400,8 +6391,8 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 	if (len > DEBUGFS_SIZE)
 		len = DEBUGFS_SIZE;
 	ret = simple_read_from_buffer(buffer, count, position, fileinfo, len);
-	kfree(fileinfo);
 bail:
+	kfree(fileinfo);
 	return ret;
 }
 
