@@ -79,6 +79,9 @@ static inline int64_t getnstimediff(struct timespec64 *start)
 
 static int fastrpc_device_create(struct fastrpc_user *fl);
 
+static int fastrpc_multidomain_ctx_cleanup(struct fastrpc_user *fl,
+	uint32_t req, uint64_t ctx);
+
 /*
 * fastrpc_update_gctx() - copy channel context to a global structure.
 * @arg1: channel context.
@@ -3299,6 +3302,7 @@ static int fastrpc_user_obj_free(struct file *file,
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_driver *frpc_drv, *d;
 	struct fastrpc_buf *buf, *b;
+	struct fastrpc_mdctx_info *mdctx = NULL, *m = NULL;
 	int i;
 	unsigned long flags, irq_flags;
 	bool locked = false, is_driver_registered = false;
@@ -3363,6 +3367,16 @@ static int fastrpc_user_obj_free(struct file *file,
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	spin_unlock_irqrestore(glock, irq_flags);
+
+	/* Iterate thru all multidomain contexts of user and destroy each one */
+	spin_lock(&fl->lock);
+	list_for_each_entry_safe(mdctx, m, &fl->mdctxs, node) {
+		spin_unlock(&fl->lock);
+		err = fastrpc_multidomain_ctx_cleanup(fl,
+			FASTRPC_MDCTX_REMOVE, mdctx->ctx);
+		spin_lock(&fl->lock);
+	}
+	spin_unlock(&fl->lock);
 
 	/*
 	 * If no driver is registered on the device, free it here.
@@ -3538,6 +3552,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	INIT_LIST_HEAD(&fl->cached_bufs);
 	INIT_LIST_HEAD(&fl->notif_queue);
 	INIT_LIST_HEAD(&fl->fastrpc_drivers);
+	INIT_LIST_HEAD(&fl->mdctxs);
 	init_waitqueue_head(&fl->proc_state_notif.notif_wait_queue);
 	spin_lock_init(&fl->proc_state_notif.nqlock);
 	init_completion(&fl->dma_invoke);
@@ -4198,6 +4213,7 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 	mdctx->domains = domains;
 	mdctx->session_ids = session_ids;
 	mdctx->tgids_frpc = tgids_frpc;
+	INIT_LIST_HEAD(&mdctx->node);
 
 	err = fastrpc_multidomain_ctx_get_tgids(dev, mdctx);
 	if (err)
@@ -4408,6 +4424,11 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	}
 	mdctx->ctx = ctx;
 	mdctx->fl = fl;
+
+	/* Add node to user's multidomain context list */
+	spin_lock(&fl->lock);
+	list_add_tail(&mdctx->node, &fl->mdctxs);
+	spin_unlock(&fl->lock);
 bail:
 	if (err) {
 		if (ctx) {
@@ -4423,6 +4444,50 @@ bail:
 	return err;
 }
 
+/* Clean-up multidomain context resources in kernel and dsp */
+static int fastrpc_multidomain_ctx_cleanup(struct fastrpc_user *fl,
+	uint32_t req, uint64_t ctx)
+{
+	int err = 0, ictx = (int)ctx;
+	struct device *dev = fl->cctx->dev;
+	struct mutex *gmut = &g_frpc.gmut;
+	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
+	struct fastrpc_mdctx_info *mdctx = NULL;
+
+	/* Release the context - if it was allocated to same client */
+	mutex_lock(gmut);
+	mdctx = (struct fastrpc_mdctx_info *)idr_find(mdctx_idr, ictx);
+	if (!mdctx || mdctx->ctx != ctx || mdctx->fl != fl) {
+		/* App potentially trying to remove ctx of another client */
+		err = -EACCES;
+		dev_err(dev, "Error %d: %s: attempting to remove ctx 0x%x of another app",
+			err, __func__, ictx);
+		goto bail;
+	}
+
+	/* Deregister context from all dsps */
+	err = fastrpc_multidomain_ctx_dsp_manage(fl, req, ctx, mdctx,
+				mdctx->num_domains);
+	if (err)
+		dev_err(dev, "Error 0x%x: %s: peer-info deregister failed for ctx 0x%x",
+			err, __func__, ictx);
+
+	idr_remove(mdctx_idr, ictx);
+
+	/* Remove node from user's multidomain context list */
+	spin_lock(&fl->lock);
+	list_del(&mdctx->node);
+	spin_unlock(&fl->lock);
+
+	kfree(mdctx->tgids_frpc);
+	kfree(mdctx->session_ids);
+	kfree(mdctx->domains);
+	kfree(mdctx);
+bail:
+	mutex_unlock(gmut);
+	return err;
+}
+
 /*
  * Release a multidomain context in kernel
  *
@@ -4431,52 +4496,20 @@ bail:
 static int fastrpc_multidomain_ctx_remove(struct fastrpc_user *fl,
 	struct fastrpc_ioctl_mdctx_manage *ctxm)
 {
-	struct device *dev = fl->cctx->dev;
-	struct mutex *gmut = &g_frpc.gmut;
-	struct idr *mdctx_idr = &g_frpc.mdctx_idr;
-	int err = 0, ii = 0, ctx = (int)ctxm->ctx;
+	int err = 0, ii = 0;
 	uint32_t rsvd = 0;
-	struct fastrpc_mdctx_info *mdctx = NULL;
 
 	/* Validate that reserved fields are all zero */
 	for (ii = 0; ii < FASTRPC_MDCTX_IOCTL_RSVD; ii++) {
 		rsvd = ctxm->reserved[ii];
 		if (rsvd) {
 			err = -EINVAL;
-			dev_err(dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
+			dev_err(fl->cctx->dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
 				err, __func__, ii, rsvd);
 			return err;
 		}
 	}
-
-	/* Release the context - if it was allocated to same client */
-	mutex_lock(gmut);
-	mdctx = (struct fastrpc_mdctx_info *)idr_find(mdctx_idr, ctx);
-	if (!mdctx || mdctx->ctx != ctxm->ctx || mdctx->fl != fl) {
-		/* App potentially trying to remove ctx of another client */
-		err = -EACCES;
-		dev_err(dev, "Error %d: %s: attempting to remove ctx 0x%x of another app",
-			err, __func__, ctx);
-		goto bail;
-	}
-
-	/* Deregister context from all dsps */
-	err = fastrpc_multidomain_ctx_dsp_manage(fl, ctxm->req, ctx, mdctx,
-				mdctx->num_domains);
-	if (err) {
-		dev_err(dev, "Error 0x%x: %s: peer-info deregister failed",
-			err, __func__);
-		goto bail;
-	}
-
-	idr_remove(mdctx_idr, ctx);
-	kfree(mdctx->tgids_frpc);
-	kfree(mdctx->session_ids);
-	kfree(mdctx->domains);
-	kfree(mdctx);
-bail:
-	mutex_unlock(gmut);
-	return err;
+	return fastrpc_multidomain_ctx_cleanup(fl, ctxm->req, ctxm->ctx);
 }
 
 /* Manage multi-domain context in kernel (register / remove) */
