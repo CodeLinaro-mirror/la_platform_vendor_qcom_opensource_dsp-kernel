@@ -6,6 +6,6 @@ ifeq ($(TARGET_KERNEL_DLKM_DISABLE), true)
 	endif
 endif
 
-#ifeq ($(FASTRPC_DLKM_ENABLED), true)
-#PRODUCT_PACKAGES += frpc-adsprpc.ko
-#endif
+ifeq ($(FASTRPC_DLKM_ENABLED), true)
+PRODUCT_PACKAGES += frpc-adsprpc.ko
+endif
