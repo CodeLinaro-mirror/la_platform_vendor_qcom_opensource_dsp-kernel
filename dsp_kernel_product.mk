@@ -7,5 +7,7 @@ ifeq ($(TARGET_KERNEL_DLKM_DISABLE), true)
 endif
 
 ifeq ($(FASTRPC_DLKM_ENABLED), true)
+ifneq ($(ENABLE_HYP), true)
 PRODUCT_PACKAGES += frpc-adsprpc.ko
+endif
 endif
