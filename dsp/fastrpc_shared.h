@@ -938,9 +938,16 @@ struct fastrpc_user {
 	struct dentry *debugfs_file;
 	char *debugfs_buf;
 #endif
+	/*
+	 * Hlos pid of process stored during device open. For untrusted apps,
+	 * this will be the pid of DSP HAL service. For trusted apps, this
+	 * will be the pid of the process itself.
+	 */
 	int tgid;
-	/* Unique pid send to dsp*/
+	/* Unique fastrpc pid sent to dsp */
 	int tgid_frpc;
+	/* Actual hlos pid of process offloading to dsp */
+	int tgid_app;
 	/* PD type of remote subsystem process */
 	u32 pd_type;
 	/* total cached buffers */
