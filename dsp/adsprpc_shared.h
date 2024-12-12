@@ -915,8 +915,8 @@ struct fastrpc_file {
 	bool poll_mode;
 	/* Threads poll for specified timeout and fall back to glink wait */
 	uint32_t poll_timeout;
-	/* Various states throughout process life cycle */
-	atomic_t dsp_process_state;
+	/* Flag to indicate dynamic process creation status*/
+	enum fastrpc_process_create_state dsp_process_state;
 	bool is_unsigned_pd;
 	/* Completion objects and state for dspsignals */
 	struct fastrpc_dspsignal *signal_groups[DSPSIGNAL_NUM_SIGNALS / DSPSIGNAL_GROUP_SIZE];
