@@ -680,6 +680,7 @@ static void fastrpc_context_free(struct kref *ref)
 	kfree(ctx->maps);
 	kfree(ctx->olaps);
 	kfree(ctx->args);
+	kfree(ctx->outbufs);
 	kfree(ctx);
 
 	fastrpc_channel_ctx_put(cctx);
@@ -843,13 +844,13 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 			ret = -ENOMEM;
 			goto err_perf_alloc;
 		}
-		ctx->perf->tid = ctx->fl->tgid;
+		ctx->perf->tid = ctx->fl->tgid_app;
 	}
 	ctx->handle = invoke->inv.handle;
 	ctx->sc = sc;
 	ctx->retval = -1;
 	ctx->pid = current->pid;
-	ctx->tgid = user->tgid;
+	ctx->tgid = user->tgid_app;
 	ctx->cctx = cctx;
 	ctx->rsp_flags = NORMAL_RESPONSE;
 	ctx->is_work_done = false;
@@ -1507,8 +1508,8 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	union fastrpc_remote_arg *rpra;
 	struct fastrpc_invoke_buf *list;
 	struct fastrpc_phy_page *pages;
-	int inbufs, i, oix, err = 0;
-	u64 len, rlen, pkt_size;
+	int inbufs, outbufs, i, oix, err = 0;
+	u64 len, rlen, pkt_size, outbufslen;
 	u64 pg_start, pg_end;
 	u64 *perf_counter = NULL;
 	uintptr_t args;
@@ -1518,6 +1519,7 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		perf_counter = (u64 *)ctx->perf + PERF_COUNT;
 
 	inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
+	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	metalen = fastrpc_get_meta_size(ctx);
 	pkt_size = fastrpc_get_payload_size(ctx, metalen);
 
@@ -1658,6 +1660,13 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		rpra[i].dma.len = ctx->args[i].length;
 		rpra[i].dma.offset = (u64) ctx->args[i].ptr;
 	}
+	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
+	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
+	if (!ctx->outbufs) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	memcpy(ctx->outbufs, rpra + inbufs, outbufslen);
 
 bail:
 	if (err)
@@ -1690,9 +1699,10 @@ static int fastrpc_put_args(struct fastrpc_invoke_ctx *ctx,
 
 	for (i = inbufs; i < ctx->nbufs; ++i) {
 		if (!ctx->maps[i]) {
-			void *src = (void *)(uintptr_t)rpra[i].buf.pv;
+			int j = i - inbufs;
+			void *src = (void *)(uintptr_t)ctx->outbufs[j].buf.pv;
 			void *dst = (void *)(uintptr_t)ctx->args[i].ptr;
-			u64 len = rpra[i].buf.len;
+			u64 len = ctx->outbufs[j].buf.len;
 
 			if (!kernel) {
 				if (copy_to_user((void __user *)dst, src, len))
@@ -2316,7 +2326,7 @@ static void fastrpc_check_privileged_process(struct fastrpc_user *fl,
 	init->attrs &= (~FASTRPC_MODE_PRIVILEGED);
 	if (gid) {
 		dev_info(fl->cctx->dev, "%s: %s (PID %d, GID %u) is a privileged process\n",
-				__func__, current->comm, fl->tgid, gid);
+				__func__, current->comm, current->tgid, gid);
 		init->attrs |= FASTRPC_MODE_PRIVILEGED;
 	}
 }
@@ -3049,7 +3059,8 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 * it is opened on their behalf by DSP HAL. This is detected by
 	 * comparing current PID with the one stored during device open.
 	 */
-	if (current->tgid != fl->tgid)
+	fl->tgid_app = current->tgid;
+	if (fl->tgid_app != fl->tgid)
 		fl->untrusted_process = true;
 
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
@@ -3401,8 +3412,8 @@ static int fastrpc_user_obj_free(struct file *file,
 
 	err = fastrpc_release_current_dsp_process(fl);
 	if (err == -ETIMEDOUT) {
-		pr_err("%s failed with err %d for process %s fl->tgid %d fl->tgid_frpc %d\n",
-			__func__, err, current->comm, fl->tgid, fl->tgid_frpc);
+		pr_err("%s failed with err %d for process %s (tgid %d, tgid_frpc %d)\n",
+			__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
 		BUG_ON(1);
 	}
 	atomic_set(&fl->state, DSP_EXIT_COMPLETE);
@@ -3573,7 +3584,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->pd_type = DEFAULT_UNUSED;
 
 	if (filp) {
-		fl->tgid = current->tgid;
+		fl->tgid = fl->tgid_app = current->tgid;
 		fl->tgid_frpc = get_unique_hlos_process_id(cctx);
 
 		if (fl->tgid_frpc == -1) {
@@ -3600,7 +3611,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 		spin_unlock_irqrestore(&cctx->lock, flags);
 	} else {
 		/* No pid will be associated with the default user-object */
-		fl->tgid = -1;
+		fl->tgid = fl->tgid_app = -1;
 		fl->tgid_frpc = -1;
 
 		/*
@@ -4086,7 +4097,7 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 	 * corresponding to given domain & find object of given session
 	 */
 	list_for_each_entry(user, &cctx->users, user) {
-		if (user->tgid == current->tgid && user->sessionid == session) {
+		if (user->tgid_app == current->tgid && user->sessionid == session) {
 			*tgid_frpc = user->tgid_frpc;
 			found = true;
 			break;
@@ -4551,7 +4562,7 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 	u32 signal_id = fsig->signal_id;
 
 	dev_dbg(fl->cctx->dev, "Send signal PID %u, unique fastrpc pid %u signal %u\n",
-					fl->tgid, fl->tgid_frpc, signal_id);
+					fl->tgid_app, fl->tgid_frpc, signal_id);
 	cctx = fl->cctx;
 	if (!(signal_id < FASTRPC_DSPSIGNAL_NUM_SIGNALS)) {
 		dev_err(fl->cctx->dev, "Sending bad signal %u for PID %u",
