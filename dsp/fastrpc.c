@@ -3,6 +3,7 @@
  * Copyright (c) 2018, Linaro Limited
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
+#include <linux/devcoredump.h>
 #include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
@@ -1059,10 +1060,11 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		pd_type = DEFAULT_UNUSED;
 
 	/*
-	 * If session allocated already and PD type is configured for non secure,
-	 * use same session.
+	 * If session is being requested for the default non-secure pd-type of
+	 * the process and it has been allocated already, then reuse that
+	 * session.
 	 */
-	if (fl->sctx && !secure)
+	if (fl->sctx && !secure && fl->sctx->pd_type == pd_type)
 		return fl->sctx;
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -1264,8 +1266,20 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 		sess = fl->secsctx;
 		pool_ctx = &fl->secsctx;
 		secure = true;
-	} else if (mflags == FASTRPC_MAP_FD_EXTENDED
-				|| mflags == FASTRPC_MAP_FD_DELAYED_EXTENDED) {
+	} else if (IS_EXTENDED_MAP_FLAG(mflags)) {
+		/*
+		 * Min page-size for extended mappings on DSP is 1MB and it increases in
+ 		 * multiples of 1MB. Min page-size for SMMU mappings is 2MB. Due to these
+		 * HW constraints, following size constraints are imposed for extended
+		 * mapping requests.
+		 */
+		if ((len < SMMU_2M) || (len % SMMU_1M != 0)) {
+			err = -EOPNOTSUPP;
+			dev_err(fl->cctx->dev,
+				"Error 0x%x: %s: Invalid size 0x%llx. Size should be a multiple of 0x%llx and greater than 0x%llx for map flag %d",
+				err, __func__, len, SMMU_1M, SMMU_2M, mflags);
+			goto attach_err;
+		}
 		sess = fl->extctx;
 		pool_ctx = &fl->extctx;
 		pd_type = EXT_MAP_PD_TYPE;
@@ -1356,6 +1370,18 @@ map_retry:
 	trace_fastrpc_dma_map(map->fl->cctx->domain_id, map->fd, map->phys,
 		map->size, map->len, map->attach->dma_map_attrs, map->flags);
 	mutex_unlock(&smmucb->map_mutex);
+
+	/*
+	 * Any mapping request with size > 2MB would be aligned to 2MB by SMMU.
+	 * Since that is the minimum size allowed for extended mapping requests,
+	 * validate that the returned iova is aligned as expected.
+	 */
+	if (IS_EXTENDED_MAP_FLAG(mflags) && !IS_ALIGNED(map->phys, SMMU_2M)) {
+		err = -EOPNOTSUPP;
+		dev_err(dev, "Error %d: %s: iova 0x%llx not aligned to 0x%llx for map flag %d",
+			err, __func__, map->phys, SMMU_2M, mflags);
+		goto assign_err;
+	}
 
 	if (attr & FASTRPC_ATTR_SECUREMAP) {
 		/*
@@ -2091,7 +2117,8 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 wait:
 	if (fl->poll_mode &&
 		handle > FASTRPC_MAX_STATIC_HANDLE &&
-		fl->cctx->domain_id == CDSP_DOMAIN_ID &&
+		(fl->cctx->domain_id == CDSP_DOMAIN_ID ||
+		fl->cctx->domain_id == ADSP_DOMAIN_ID) &&
 		(fl->pd_type == USERPD || fl->pd_type == USER_UNSIGNEDPD_POOL))
 		ctx->rsp_flags = POLL_MODE;
 
@@ -2331,7 +2358,30 @@ static void fastrpc_check_privileged_process(struct fastrpc_user *fl,
 	}
 }
 
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
+static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct fastrpc_buf *buf)
+{
+	u64 src_perms = 0;
+	struct qcom_scm_vmperm dst_perms;
+	int i, err = 0;
+
+	if (cctx->vmcount) {
+		for (i = 0; i < cctx->vmcount; i++)
+			src_perms |= BIT(cctx->vmperms[i].vmid);
+
+		dst_perms.vmid = QCOM_SCM_VMID_HLOS;
+		dst_perms.perm = QCOM_SCM_PERM_RWX;
+		err = qcom_scm_assign_mem(buf->phys, (u64)buf->size,
+					&src_perms, &dst_perms, 1);
+		if (err) {
+			dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d\n",
+				__func__, buf->phys, buf->size, err);
+			return err;
+		}
+	}
+	return 0;
+}
+
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 {
 	struct fastrpc_buf *buf, *b, *match;
 	unsigned long flags;
@@ -2349,27 +2399,16 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
 		if (!match)
 			return 0;
 
-		if (cctx->vmcount) {
-			u64 src_perms = 0;
-			struct qcom_scm_vmperm dst_perms;
-			u32 i;
-
-			for (i = 0; i < cctx->vmcount; i++)
-				src_perms |= BIT(cctx->vmperms[i].vmid);
-
-			dst_perms.vmid = QCOM_SCM_VMID_HLOS;
-			dst_perms.perm = QCOM_SCM_PERM_RWX;
-			err = qcom_scm_assign_mem(match->phys, (u64)match->size,
-							&src_perms, &dst_perms, 1);
+		if (is_pdr) {
+			err = fastrpc_remote_heap_unassign(cctx, match);
 			if (err) {
-				dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d",
-					__func__, match->phys, match->size, err);
 				spin_lock_irqsave(&cctx->lock, flags);
 				list_add_tail(&match->node, &cctx->gmaps);
 				spin_unlock_irqrestore(&cctx->lock, flags);
 				return err;
 			}
 		}
+
 		__fastrpc_buf_free(match);
 
 	} while (match);
@@ -2473,7 +2512,6 @@ static int fastrpc_init_sensor_static_pd_status(struct fastrpc_user *fl)
 	return err;
 }
 
-#ifdef CONFIG_DEBUG_FS
 void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 {
     seq_printf(s_file,"\n %s %2s 0x%p", "virt", ":", buf->virt);
@@ -2633,9 +2671,9 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 				print_map_info(s_file, map);
 		}
 		seq_printf(s_file,"\n=============== Kernel maps ===============\n");
-		list_for_each_entry(map, &fl->mmaps, node) {
-			if (map)
-				print_map_info(s_file, map);
+		list_for_each_entry(buf, &fl->mmaps, node) {
+			if (buf)
+				print_buf_info(s_file, buf);
 		}
 		seq_printf(s_file,"\n=============== Cached Bufs ===============\n");
 		list_for_each_entry_safe(buf, n, &fl->cached_bufs, node) {
@@ -2656,7 +2694,7 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 	}
 	return 0;
 }
-
+#ifdef CONFIG_DEBUG_FS
 DEFINE_SHOW_ATTRIBUTE(fastrpc_debugfs);
 
 static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
@@ -2775,7 +2813,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		 * Remove any previous mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
-		err = fastrpc_mmap_remove_ssr(fl->cctx);
+		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
 		if (err) {
 			pr_warn("%s: %s: failed to unmap remote heap (err %d)\n",
 				current->comm, __func__, err);
@@ -3251,21 +3289,20 @@ static int fastrpc_release_current_dsp_process(struct fastrpc_user *fl)
 	return fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_NONZERO_PID, &ioctl);
 }
 
-/* Helper function to increment / decrement invoke count of channel */
+/*
+ * Helper function to increment / decrement invoke count of channel
+ * Caller of this function MUST spin-lock 'cctx->lock' first.
+ */
 static inline void fastrpc_channel_update_invoke_cnt(
 		struct fastrpc_channel_ctx *cctx, bool incr)
 {
-	unsigned long flags = 0;
-
 	if (incr) {
-		atomic_inc(&cctx->invoke_cnt);
+		cctx->invoke_cnt++;
 	} else {
-		spin_lock_irqsave(&cctx->lock, flags);
-		atomic_dec(&cctx->invoke_cnt);
+		cctx->invoke_cnt--;
 		/* Wake up any waiting SSR handling thread */
-		if (atomic_read(&cctx->invoke_cnt) == 0)
+		if (cctx->invoke_cnt == 0)
 			wake_up_interruptible(&cctx->ssr_wait_queue);
-		spin_unlock_irqrestore(&cctx->lock, flags);
 	}
 }
 
@@ -3485,9 +3522,9 @@ skip_user_cleanup:
 	kfree(fl);
 
 	if (file) {
-		spin_lock_irqsave(glock, irq_flags);
+		spin_lock_irqsave(&cctx->lock, flags);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
-		spin_unlock_irqrestore(glock, irq_flags);
+		spin_unlock_irqrestore(&cctx->lock, flags);
 
 		fastrpc_channel_ctx_put(cctx);
 		file->private_data = NULL;
@@ -3912,9 +3949,10 @@ static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 tim
 {
 	const unsigned int MAX_POLL_TIMEOUT_US = 10000;
 
-	if ((fl->cctx->domain_id != CDSP_DOMAIN_ID) || (fl->pd_type != USERPD &&
-			fl->pd_type != USER_UNSIGNEDPD_POOL)) {
-		dev_err(fl->cctx->dev,"poll mode only allowed for dynamic CDSP process\n");
+	if ((fl->cctx->domain_id != CDSP_DOMAIN_ID &&
+		fl->cctx->domain_id != ADSP_DOMAIN_ID) ||
+		(fl->pd_type != USERPD && fl->pd_type != USER_UNSIGNEDPD_POOL)) {
+		dev_err(fl->cctx->dev, "poll mode only allowed for dynamic CDSP and ADSP process\n");
 		return -EPERM;
 	}
 	if (timeout > MAX_POLL_TIMEOUT_US) {
@@ -4075,6 +4113,7 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 {
 	int err = 0;
 	bool found = false;
+	unsigned long flags = 0;
 	struct fastrpc_channel_ctx *cctx = NULL;
 	struct fastrpc_user *user = NULL;
 
@@ -4090,8 +4129,8 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 		err = -EPIPE;
 		goto bail;
 	}
+	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, true);
-
 	/*
 	 * Search for user objects of current process on remote channel
 	 * corresponding to given domain & find object of given session
@@ -4107,6 +4146,7 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 	if (!found)
 		err = -ESRCH;
 	fastrpc_channel_update_invoke_cnt(cctx, false);
+	spin_unlock_irqrestore(&cctx->lock, flags);
 bail:
 	fastrpc_channel_ctx_put(cctx);
 	return err;
@@ -4257,6 +4297,7 @@ static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_mdctx_info *mdctx, uint32_t num_domains)
 {
 	int err = 0;
+	unsigned long flags = 0;
 	struct fastrpc_enhanced_invoke invoke = {0};
 	struct fastrpc_invoke_args args[4] = {0};
 	struct {
@@ -4275,7 +4316,9 @@ static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
 		err = -EPIPE;
 		goto bail;
 	}
+	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, true);
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	/* Convert logical domain ids to physical ids */
 
@@ -4305,7 +4348,9 @@ static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
 
 	err = fastrpc_internal_invoke(cctx->default_user,
 					KERNEL_MSG_WITH_ZERO_PID, &invoke);
+	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
+	spin_unlock_irqrestore(&cctx->lock, flags);
 bail:
 	fastrpc_channel_ctx_put(cctx);
 	return err;
@@ -4417,7 +4462,6 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);
 
 	if (err < 0) {
-		mutex_unlock(gmut);
 		dev_err(dev, "Error %d: %s: idr alloc failed", err, __func__);
 		goto bail;
 	}
@@ -4427,13 +4471,10 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	err = fastrpc_multidomain_ctx_dsp_manage(fl, ctxm->req, ctx, mdctx,
 				mdctx->num_domains);
 	if (err) {
-		mutex_unlock(gmut);
 		dev_err(dev, "Error 0x%x: %s: peer-info register failed",
 			err, __func__);
 		goto bail;
 	}
-
-	mutex_unlock(gmut);
 
 	/* Copy context back to user */
 	err = copy_to_user((void __user *)ctxm->ctx, &ctx, sizeof(ctx));
@@ -4452,16 +4493,15 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	spin_unlock(&fl->lock);
 bail:
 	if (err) {
-		if (ctx) {
-			mutex_lock(gmut);
+		if (ctx)
 			idr_remove(mdctx_idr, ctx);
-			mutex_unlock(gmut);
-		}
+
 		kfree(mdctx->tgids_frpc);
 		kfree(mdctx->session_ids);
 		kfree(mdctx->domains);
 		kfree(mdctx);
 	}
+	mutex_unlock(gmut);
 	return err;
 }
 
@@ -4549,6 +4589,81 @@ static int fastrpc_multidomain_ctx_manage(struct fastrpc_user *fl,
 	default:
 		err = -EBADRQC;
 		break;
+	}
+	return err;
+}
+
+/* Make rpc call to dsp to trigger a dump of remote-process state */
+static int fastrpc_remote_process_state_dump(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_remote_proc_state_dump *proc)
+{
+	int err = 0, fd = proc->fd;
+	s32 tgid_frpc = -1;
+	u32 domain = proc->domain, session = proc->session;
+	struct device *dev = fl->cctx->dev;
+	struct fastrpc_enhanced_invoke invoke = {0};
+	struct fastrpc_invoke_args args[2] = {0};
+	struct fastrpc_map *map = NULL;
+	struct fastrpc_phy_page page = {0};
+	struct {
+		s32 tgid_frpc;
+		u32 flags;
+		s32 num_pages;
+	} inargs = {0};
+
+	/* Validate domain and session id passed by user-app */
+	if (!IS_VALID_DOMAIN_ID(domain) || !IS_VALID_SESSION_ID(session)) {
+		err = -EBADR;
+		dev_err(dev, "Error %d: %s: domain %u or session %u is invalid",
+			err, __func__, domain, session);
+		return err;
+	}
+
+	/* Retrieve the fastrpc pid of the session */
+	err = fastrpc_get_frpc_tgid(domain, session, &tgid_frpc);
+	if (err) {
+		dev_err(dev, "Error %d: %s: failed to get frpc tgid for domain %u, session %u",
+			err, __func__, domain, session);
+		return err;
+	}
+
+	/* Create smmu mapping of user's string buffer */
+	mutex_lock(&fl->map_mutex);
+	err = fastrpc_map_create(fl, fd, 0, NULL, proc->size, 0, 0,
+			&map, true);
+	mutex_unlock(&fl->map_mutex);
+	if (err) {
+		dev_err(dev, "Error %d: %s: smmu map failed for log-buf fd %d, size %u",
+			err, __func__, fd, proc->size);
+		return err;
+	}
+
+	/* Prepare args for kernel rpc call to rootpd */
+	inargs.tgid_frpc = tgid_frpc;
+	inargs.flags = proc->level;
+	inargs.num_pages = 1;
+
+	args[0].ptr = (u64)(uintptr_t)&inargs;
+	args[0].length = sizeof(inargs);
+	args[0].fd = -1;
+
+	page.addr = map->phys;
+	page.size = map->size;
+	args[1].ptr = (u64)(uintptr_t)&page;
+	args[1].length = sizeof(page) * inargs.num_pages;
+	args[1].fd = -1;
+
+	invoke.inv.handle = FASTRPC_INIT_HANDLE;
+	invoke.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_PROCESS_DUMP, 2, 0);
+	invoke.inv.args = (__u64)args;
+
+	/* Make rpc call to rootpd to dump remote process state */
+	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &invoke);
+
+	if (map) {
+		mutex_lock(&fl->map_mutex);
+		fastrpc_map_put(map);
+		mutex_unlock(&fl->map_mutex);
 	}
 	return err;
 }
@@ -4801,6 +4916,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_internal_config config;
 	struct fastrpc_internal_sessinfo sessinfo;
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
+	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	int err = 0;
@@ -4877,6 +4993,12 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			sizeof(ctxm)))
 			return -EFAULT;
 		err = fastrpc_multidomain_ctx_manage(fl, &ctxm);
+		break;
+	case FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP:
+		if (copy_from_user(&proc, (void __user *)(uintptr_t)invoke.invparam,
+			sizeof(proc)))
+			return -EFAULT;
+		err = fastrpc_remote_process_state_dump(fl, &proc);
 		break;
 	default:
 		err = -ENOTTY;
@@ -5599,8 +5721,9 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 			atomic_set(&fl->state, DSP_CREATE_COMPLETE);
 	}
 
+	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
-
+	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_channel_ctx_put(fl->cctx);
 	return err;
 }
@@ -5662,6 +5785,7 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
+	bool is_cnt_updated = false;
 	union fastrpc_dev_param p;
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_map *map = NULL;
@@ -5671,7 +5795,6 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	spinlock_t *glock = &g_frpc.glock;
 
 	p.map = (struct fastrpc_dev_map_dma *)invoke_param;
-
 
 	spin_lock_irqsave(glock, irq_flags);
 	if (!dev || dev->dev_close) {
@@ -5692,6 +5815,22 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	fastrpc_channel_ctx_get(cctx);
 	fl->is_dma_invoke_pend = true;
 	spin_unlock_irqrestore(glock, irq_flags);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, irq_flags);
+		err = -EPIPE;
+		goto error;
+	} else {
+		/*
+		 * Update invoke count to block SSR handling thread
+		 * from cleaning up the channel resources, while it
+		 * is stillbeing used by this thread.
+		 */
+		fastrpc_channel_update_invoke_cnt(cctx, true);
+		is_cnt_updated = true;
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	/* Map DMA buffer on SMMU device*/
 	mutex_lock(&fl->remote_map_mutex);
@@ -5742,9 +5881,12 @@ error:
 		}
 		fl->is_dma_invoke_pend = false;
 	}
+	if (is_cnt_updated) {
+		mutex_unlock(&fl->remote_map_mutex);
+		fastrpc_channel_update_invoke_cnt(cctx, false);
+	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
-	mutex_unlock(&fl->remote_map_mutex);
 	return err;
 }
    /*
@@ -5762,6 +5904,7 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
+	bool is_cnt_updated = false;
 	union fastrpc_dev_param p;
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_map *map = NULL;
@@ -5789,6 +5932,22 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 	fastrpc_channel_ctx_get(cctx);
 	fl->is_dma_invoke_pend = true;
 	spin_unlock_irqrestore(glock, irq_flags);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, irq_flags);
+		err = -EPIPE;
+		goto error;
+	} else {
+		/*
+		 * Update invoke count to block SSR handling thread
+		 * from cleaning up the channel resources, while it
+		 * is stillbeing used by this thread.
+		 */
+		fastrpc_channel_update_invoke_cnt(cctx, true);
+		is_cnt_updated = true;
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
@@ -5831,9 +5990,12 @@ error:
 		}
 		fl->is_dma_invoke_pend = false;
 	}
+	if (is_cnt_updated) {
+		mutex_unlock(&fl->remote_map_mutex);
+		fastrpc_channel_update_invoke_cnt(cctx, false);
+	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
-	mutex_unlock(&fl->remote_map_mutex);
 	return err;
 }
    /*
@@ -6164,6 +6326,117 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 	return;
 }
 
+static inline void populate_dump_metadata(struct fastrpc_dump_info *entry,
+		u64 offset, u64 size, enum fastrpc_dump_type type, u64 addr)
+{
+	entry->offset = offset;
+	entry->size = size;
+	entry->type = type;
+	entry->phys = addr;
+}
+
+void frpc_coredump(struct fastrpc_channel_ctx *cctx)
+{
+	int iter = 0, err = 0;
+	bool scm_done = false;
+	struct device *dev = cctx->dev;
+	char *pos = NULL, *dump = NULL;
+	u64 total_size = 0, offset = 0;
+	struct fastrpc_user *user, *n;
+	struct seq_file *s_file = NULL;
+	struct fastrpc_dump_info *dinfo;
+	struct fastrpc_buf *buf, *b;
+
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
+		total_size += buf->size;
+
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
+		total_size += DBG_FS_SIZE;
+		if (user->init_mem)
+			total_size += user->init_mem->size;
+	}
+
+	total_size += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
+	dump = vmalloc(total_size);
+	if (!dump) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	pos = dump;
+	dinfo = (struct fastrpc_dump_info *)dump;
+	pos += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
+	offset += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
+
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+		err = fastrpc_remote_heap_unassign(cctx, buf);
+		if (err) {
+			list_del(&buf->node);
+			continue;
+		}
+		if ((dump + total_size) - pos >= buf->size) {
+			memcpy(pos, buf->virt, buf->size);
+			populate_dump_metadata(&dinfo[iter], offset, buf->size,
+				CMA, buf->phys);
+			pos += buf->size;
+			iter += 1;
+			offset += buf->size;
+		}
+	}
+	scm_done = true;
+	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
+	if (!s_file) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->size = DBG_FS_SIZE;
+
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
+		s_file->private = user;
+		if ((dump + total_size) - pos >= DBG_FS_SIZE)
+			s_file->buf = pos;
+		else {
+			err = -EFAULT;
+			goto bail;
+		}
+		fastrpc_debugfs_show(s_file, NULL);
+		if (s_file->buf) {
+			memcpy(pos, s_file->buf, DBG_FS_SIZE);
+			populate_dump_metadata(&dinfo[iter], offset, DBG_FS_SIZE, DEBUGFS, 0);
+			pos += DBG_FS_SIZE;
+			iter += 1;
+			offset += DBG_FS_SIZE;
+		}
+		if (user->init_mem) {
+			if ((dump + total_size) - pos >= user->init_mem->size) {
+				memcpy(pos, user->init_mem->virt, user->init_mem->size);
+				populate_dump_metadata(&dinfo[iter], offset, user->init_mem->size,
+					INIT_MEM, user->init_mem->phys);
+				pos += user->init_mem->size;
+				iter += 1;
+				offset += user->init_mem->size;
+			} else {
+				err = -EFAULT;
+				goto bail;
+			}
+		}
+	}
+
+	dev_coredumpv(dev, dump, total_size, GFP_KERNEL);
+bail:
+	if (!scm_done) {
+		list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+			err = fastrpc_remote_heap_unassign(cctx, buf);
+			if (err) {
+				list_del(&buf->node);
+			}
+		}
+	}
+	if (err)
+		pr_err("%s : Failed to dump user data for iter %d err %d\n",
+					__func__, iter, err);
+	kfree(s_file);
+}
+
 static const struct file_operations fastrpc_fops = {
 	.open = fastrpc_device_open,
 	.release = fastrpc_device_release,
@@ -6183,8 +6456,9 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	struct fastrpc_buf *buf = NULL;
 	struct iommu_domain *domain = NULL;
 	struct gen_pool *gen_pool = NULL;
-	int frpc_gen_addr_pool[2] = {0, 0};
-	u32 smmu_alloc_range[2] = {0, 0};
+	int frpc_gen_addr_pool[2] = {0};
+	u32 smmu_alloc_range32[2] = {0};
+	u64 smmu_alloc_range64[2] = {0};
 	struct sg_table sgt;
 	struct fastrpc_smmu *smmucb = NULL;
 #ifdef CONFIG_DEBUG_FS
@@ -6265,13 +6539,24 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	if (of_property_read_u32(dev->of_node, "reg", &smmucb->sid))
 		dev_info(dev, "FastRPC Session ID not specified in DT\n");
 
-	/* Set SMMU context bank, min and max allocation range */
-	if (!of_property_read_u32_array(dev->of_node, "alloc-size-range",
-							smmu_alloc_range, sizeof(smmu_alloc_range))) {
-		smmucb->minallocsize = smmu_alloc_range[0];
-		smmucb->maxallocsize = smmu_alloc_range[1];
+	/*
+	 * Set SMMU context bank, min and max allocation range.
+	 * Read alloc-size-range property according to defintion array
+	 * type in devicetree.
+	 */
+	if (!of_property_read_u64_array(dev->of_node, "alloc-size-range",
+				smmu_alloc_range64,
+				sizeof(smmu_alloc_range64)/sizeof(smmu_alloc_range64[0]))) {
+		smmucb->minallocsize = smmu_alloc_range64[0];
+		smmucb->maxallocsize = smmu_alloc_range64[1];
+	} else if (!of_property_read_u32_array(dev->of_node, "alloc-size-range",
+				smmu_alloc_range32,
+				sizeof(smmu_alloc_range32)/sizeof(smmu_alloc_range32[0]))) {
+		smmucb->minallocsize = (u64)smmu_alloc_range32[0];
+		smmucb->maxallocsize = (u64)smmu_alloc_range32[1];
 	}
-	smmucb->totalbytes = SMMU_4GB_ADDRESS_SPACE;
+
+	smmucb->totalbytes = (1ULL << smmucb->pa_bits) - 1;
 
 	/* Set SMMU device private data with fastrpc SMMU CB pointer */
 	dev_set_drvdata(dev, smmucb);
