@@ -57,8 +57,9 @@
 #define MAX_FRPC_TGID 64
 #define COPY_BUF_WARN_LIMIT (512*1024)
 #define SMMU_4K 0x1000
-#define SMMU_2M 0x200000
-#define SMMU_1G 0x40000000
+#define SMMU_1M 0x100000ULL
+#define SMMU_2M 0x200000ULL
+#define SMMU_1G 0x40000000ULL
 
 /*
  * Align the size to next IOMMU page size
@@ -359,6 +360,11 @@
  */
 #define RECONSTRUCT_IOVA_FROM_SID_PA(sid, phys, sid_pos) \
 	(phys += sid << sid_pos)
+
+/* Check if the given flag is used for extended UDMA mapping */
+#define IS_EXTENDED_MAP_FLAG(flag) \
+	(flag == FASTRPC_MAP_FD_EXTENDED || \
+	flag == FASTRPC_MAP_FD_DELAYED_EXTENDED)
 
 /*
  * Process types on remote subsystem
