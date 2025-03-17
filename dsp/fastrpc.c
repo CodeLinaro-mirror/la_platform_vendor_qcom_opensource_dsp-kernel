@@ -1060,11 +1060,10 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		pd_type = DEFAULT_UNUSED;
 
 	/*
-	 * If session is being requested for the default non-secure pd-type of
-	 * the process and it has been allocated already, then reuse that
-	 * session.
+	 * If session allocated already and PD type is configured for non secure,
+	 * use same session.
 	 */
-	if (fl->sctx && !secure && fl->sctx->pd_type == pd_type)
+	if (fl->sctx && !secure)
 		return fl->sctx;
 
 	spin_lock_irqsave(&cctx->lock, flags);
