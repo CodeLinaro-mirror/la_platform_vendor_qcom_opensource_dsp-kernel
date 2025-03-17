@@ -6393,8 +6393,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 
 	/* Set SMMU context bank, min and max allocation range */
 	if (!of_property_read_u32_array(dev->of_node, "alloc-size-range",
-				smmu_alloc_range,
-				sizeof(smmu_alloc_range)/sizeof(smmu_alloc_range[0]))) {
+							smmu_alloc_range, sizeof(smmu_alloc_range))) {
 		smmucb->minallocsize = smmu_alloc_range[0];
 		smmucb->maxallocsize = smmu_alloc_range[1];
 	}
