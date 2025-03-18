@@ -56,10 +56,10 @@
 #define SESSION_ID_MASK (1 << SESSION_ID_INDEX)
 #define MAX_FRPC_TGID 64
 #define COPY_BUF_WARN_LIMIT (512*1024)
-#define SMMU_4GB_ADDRESS_SPACE 0xFFFFFFFF
 #define SMMU_4K 0x1000
-#define SMMU_2M 0x200000
-#define SMMU_1G 0x40000000
+#define SMMU_1M 0x100000ULL
+#define SMMU_2M 0x200000ULL
+#define SMMU_1G 0x40000000ULL
 
 /*
  * Align the size to next IOMMU page size
@@ -289,6 +289,9 @@
 #define OIS_PDR_ADSP_SERVICE_NAME              "tms/servreg"
 #define ADSP_OISPD_NAME                        "msm/adsp/ois_pd"
 
+#define DBG_FS_SIZE (200*1024)
+#define NUM_DUMPED (128)
+
 #define PERF_END ((void)0)
 
 #define PERF(enb, cnt, ff) \
@@ -358,6 +361,11 @@
 #define RECONSTRUCT_IOVA_FROM_SID_PA(sid, phys, sid_pos) \
 	(phys += sid << sid_pos)
 
+/* Check if the given flag is used for extended UDMA mapping */
+#define IS_EXTENDED_MAP_FLAG(flag) \
+	(flag == FASTRPC_MAP_FD_EXTENDED || \
+	flag == FASTRPC_MAP_FD_DELAYED_EXTENDED)
+
 /*
  * Process types on remote subsystem
  * Always add new PD types at the end, before MAX_PD_TYPE
@@ -395,6 +403,7 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_MEM_MAP       = 10,
 	FASTRPC_RMID_INIT_MEM_UNMAP     = 11,
 	FASTRPC_RMID_INIT_MDCTX_MANAGE  = 12,
+	FASTRPC_RMID_INIT_PROCESS_DUMP  = 13,
 	FASTRPC_RMID_INIT_MAX,
 };
 
@@ -447,6 +456,23 @@ enum fastrpc_map_state {
 	FD_DSP_MAP_COMPLETE,
 	/* Initiated DSP unmapping */
 	FD_DSP_UNMAP_IN_PROGRESS,
+};
+
+enum fastrpc_dump_type {
+	CMA = 0,
+	DEBUGFS = 1,
+	INIT_MEM = 2,
+};
+
+struct fastrpc_dump_info{
+	/* Type of memory dumped */
+	enum fastrpc_dump_type type;
+	/* Offset at which is a particular memory dumped*/
+	u64 offset;
+	/* Length of memory dumped */
+	u64 size;
+	/*ipa of memory dumped */
+	u64 phys;
 };
 
 struct fastrpc_socket {
@@ -774,7 +800,7 @@ struct fastrpc_channel_ctx {
 	/* Flag to indicate CB pooling is enabled for channel */
 	bool smmucb_pool;
 	/* Number of active ongoing invocations (device ioctl / release) */
-	atomic_t invoke_cnt;
+	u32 invoke_cnt;
 	/* Completion object for threads to wait for SSR handling to finish */
 	struct completion ssr_complete;
 	/* Wait queue to block/resume SSR until all invocations are complete */
