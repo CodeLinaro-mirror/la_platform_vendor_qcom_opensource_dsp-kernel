@@ -1406,6 +1406,7 @@ map_retry:
 		smmuidx++;
 		goto map_retry;
 	} else if (err) {
+		mutex_unlock(&smmucb->map_mutex);
 		goto map_err;
 	}
 
