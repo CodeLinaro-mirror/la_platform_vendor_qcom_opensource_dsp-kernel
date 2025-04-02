@@ -5035,6 +5035,37 @@ static int fastrpc_dspsignal_create(struct fastrpc_user *fl,
 	return err;
 }
 
+static int fastrpc_dspsignal_destroy_all(struct fastrpc_user *fl)
+{
+	u32 i = 0, j = 0;
+	struct fastrpc_dspsignal *s = NULL;
+	struct fastrpc_dspsignal *group = NULL;
+	unsigned long irq_flags = 0;
+
+	dev_dbg(fl->cctx->dev, "Destroy all signals\n");
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
+	for (i = 0;
+	i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS/FASTRPC_DSPSIGNAL_GROUP_SIZE);
+	i++) {
+		if (fl->signal_groups[i] != NULL) {
+			group = fl->signal_groups[i];
+			for (j = 0; j < FASTRPC_DSPSIGNAL_GROUP_SIZE; j++) {
+				s = &group[j];
+				if (s->state == DSPSIGNAL_STATE_PENDING) {
+					s->state = DSPSIGNAL_STATE_CANCELED;
+					complete_all(&s->comp);
+				}
+			}
+		}
+	}
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+
+	dev_dbg(fl->cctx->dev, "Signals destroyed\n");
+
+	return 0;
+}
+
 static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 			      struct fastrpc_internal_dspsignal *fsig)
 {
@@ -6494,6 +6525,8 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 			ctx->retval, ctx->pid, ctx->pid, ctx->sc);
 		complete(&ctx->work);
 	}
+
+	fastrpc_dspsignal_destroy_all(user);
 	spin_unlock(&user->lock);
 }
 
