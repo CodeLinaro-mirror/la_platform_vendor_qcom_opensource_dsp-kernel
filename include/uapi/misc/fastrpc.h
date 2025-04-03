@@ -22,6 +22,9 @@
 /* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
 #define FASTRPC_MDCTX_IOCTL_RSVD 8
 
+/* Reserved fields in fastrpc_internal_proc_timeout ioctl structs */
+#define FASTRPC_RPC_TIMEOUT_IOCTL_RSVD 5
+
 /**
  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
  * @FASTRPC_MAP_STATIC: Map memory pages with RW- permission and CACHE WRITEBACK.
@@ -51,6 +54,16 @@ enum fastrpc_map_flags {
 	FASTRPC_MAP_FD_EXTENDED,
 	FASTRPC_MAP_FD_DELAYED_EXTENDED,
 	FASTRPC_MAP_MAX,
+};
+
+/* Types of DSP available */
+enum fastrpc_dsp_type {
+	FASTRPC_NSP =  1,
+	FASTRPC_LPASS,
+	FASTRPC_SDSP,
+	FASTRPC_MDSP,
+	FASTRPC_HPASS,
+	FASTRPC_MAX_DSP_TYPE,
 };
 
 enum fastrpc_proc_attr {
@@ -102,7 +115,9 @@ struct fastrpc_ioctl_multimode_invoke {
 	__u32 req;	/* enum fastrpc_multimode_invoke_type */
 	__u64 invparam;
 	__u64 size;
-	__u32 reserved[8];
+	/* Flag to notify if dynamic domain discovery is enabled */
+	__u32 dynamic_domains;
+	__u32 reserved[7];
 };
 
 enum fastrpc_multimode_invoke_type {
@@ -116,6 +131,7 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_SESSIONINFO = 8,
 	FASTRPC_INVOKE_MDCTX_MANAGE = 9,
 	FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP = 10,
+	FASTRPC_INVOKE_SET_RPC_TIMEOUT = 11,
 };
 
 struct fastrpc_init_create {
@@ -223,6 +239,14 @@ struct fastrpc_ioctl_remote_proc_state_dump {
 	__u32 reserved[5];
 };
 
+/* Payload for FASTRPC_INVOKE_SET_RPC_TIMEOUT type */
+struct fastrpc_internal_proc_timeout {
+	/* Timeout in ms */
+	__u32 timeout;
+	/* Reserved for future use */
+	__u32 reserved[FASTRPC_RPC_TIMEOUT_IOCTL_RSVD];
+};
+
 enum fastrpc_control_type {
 	FASTRPC_CONTROL_LATENCY		=	1,
 	FASTRPC_CONTROL_SMMU		=	2,
@@ -250,6 +274,8 @@ enum fastrpc_status_flags {
 	FASTRPC_USERPD_FORCE_KILL	= 2,
 	FASTRPC_USERPD_EXCEPTION	= 3,
 	FASTRPC_DSP_SSR				= 4,
+	FASTRPC_USERPD_RELEASE		= 5,
+	FASTRPC_USERPD_TIMEOUT		= 6,
 };
 
 struct fastrpc_ioctl_capability {
