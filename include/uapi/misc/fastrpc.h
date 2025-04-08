@@ -16,14 +16,7 @@
 #define FASTRPC_IOCTL_INIT_CREATE_STATIC _IOWR('R', 9, struct fastrpc_init_create_static)
 #define FASTRPC_IOCTL_MEM_MAP		_IOWR('R', 10, struct fastrpc_mem_map)
 #define FASTRPC_IOCTL_MEM_UNMAP		_IOWR('R', 11, struct fastrpc_mem_unmap)
-#define FASTRPC_IOCTL_MULTIMODE_INVOKE	_IOWR('R', 12, struct fastrpc_ioctl_multimode_invoke)
 #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
-
-/* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
-#define FASTRPC_MDCTX_IOCTL_RSVD 8
-
-/* Reserved fields in fastrpc_internal_proc_timeout ioctl structs */
-#define FASTRPC_RPC_TIMEOUT_IOCTL_RSVD 5
 
 /**
  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
@@ -51,19 +44,7 @@ enum fastrpc_map_flags {
 	FASTRPC_MAP_FD = 2,
 	FASTRPC_MAP_FD_DELAYED,
 	FASTRPC_MAP_FD_NOMAP = 16,
-	FASTRPC_MAP_FD_EXTENDED,
-	FASTRPC_MAP_FD_DELAYED_EXTENDED,
 	FASTRPC_MAP_MAX,
-};
-
-/* Types of DSP available */
-enum fastrpc_dsp_type {
-	FASTRPC_NSP =  1,
-	FASTRPC_LPASS,
-	FASTRPC_SDSP,
-	FASTRPC_MDSP,
-	FASTRPC_HPASS,
-	FASTRPC_MAX_DSP_TYPE,
 };
 
 enum fastrpc_proc_attr {
@@ -81,13 +62,10 @@ enum fastrpc_proc_attr {
 	FASTRPC_MODE_SYSTEM_PROCESS	= (1 << 5),
 	/* Macro for Prvileged Process */
 	FASTRPC_MODE_PRIVILEGED		= (1 << 6),
-	/* Macro for system unsigned PD */
-	FASTRPC_MODE_SYSTEM_UNSIGNED_PD	= 1 << 17,
 };
 
 /* Fastrpc attribute for memory protection of buffers */
 #define FASTRPC_ATTR_SECUREMAP	(1)
-#define FASTRPC_ATTR_NOVA		(256)
 
 struct fastrpc_invoke_args {
 	__u64 ptr;
@@ -100,38 +78,6 @@ struct fastrpc_invoke {
 	__u32 handle;
 	__u32 sc;
 	__u64 args;
-};
-
-struct fastrpc_enhanced_invoke {
-	struct fastrpc_invoke inv;
-	__u64 crc;
-	__u64 perf_kernel;
-	__u64 perf_dsp;
-	__u32 priority;
-	__u32 reserved[19];
-};
-
-struct fastrpc_ioctl_multimode_invoke {
-	__u32 req;	/* enum fastrpc_multimode_invoke_type */
-	__u64 invparam;
-	__u64 size;
-	/* Flag to notify if dynamic domain discovery is enabled */
-	__u32 dynamic_domains;
-	__u32 reserved[7];
-};
-
-enum fastrpc_multimode_invoke_type {
-	FASTRPC_INVOKE			= 1,
-	FASTRPC_INVOKE_ENHANCED	= 2,
-	FASTRPC_INVOKE_CONTROL = 3,
-	FASTRPC_INVOKE_DSPSIGNAL = 4,
-	FASTRPC_INVOKE_NOTIF = 5,
-	FASTRPC_INVOKE_MULTISESSION = 6,
-	FASTRPC_INVOKE_CONFIG = 7,
-	FASTRPC_INVOKE_SESSIONINFO = 8,
-	FASTRPC_INVOKE_MDCTX_MANAGE = 9,
-	FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP = 10,
-	FASTRPC_INVOKE_SET_RPC_TIMEOUT = 11,
 };
 
 struct fastrpc_init_create {
@@ -187,116 +133,11 @@ struct fastrpc_mem_unmap {
 	__s32 reserved[5];
 };
 
-/* Types of context manage requests */
-enum fastrpc_mdctx_manage_req {
-	/* Setup multidomain context in kernel */
-	FASTRPC_MDCTX_SETUP,
-	/* Delete multidomain context in kernel */
-	FASTRPC_MDCTX_REMOVE,
-};
-
-/* Payload for FASTRPC_INVOKE_MDCTX_MANAGE type */
-struct fastrpc_ioctl_mdctx_manage {
-	/*
-	 * Type of ctx manage request.
-	 * One of "enum fastrpc_mdctx_manage_req"
-	 */
-	__u32 req;
-	/* ctx id in userspace */
-	__u64 user_ctx;
-	/* User-addr to list of domains on which context is being managed */
-	__u64 domain_ids;
-	/* User-addr to list of domains on which context is being managed */
-	__u64 session_ids;
-	/* Number of domain ids */
-	__u32 num_domains;
-	/*
-	 * ctx setup req  : user-addr where unique 64-bit context generated
-	 *                  by kernel is copied to
-	 * ctx remove req : ctx id to be removed
-	 */
-	__u64 ctx;
-	__u32 reserved[FASTRPC_MDCTX_IOCTL_RSVD];
-};
-
-/* Payload for FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP type */
-struct fastrpc_ioctl_remote_proc_state_dump {
-	/* Domain id of dsp on which remote process is running */
-	__u32 domain;
-
-	/* Session id of remote process */
-	__u32 session;
-
-	/* Level of logging on remote subsystem */
-	__u32 level;
-
-	/* String buffer where process state log will be written to */
-	__s32 fd;
-
-	/* Size of buffer */
-	__u32 size;
-
-	__u32 reserved[5];
-};
-
-/* Payload for FASTRPC_INVOKE_SET_RPC_TIMEOUT type */
-struct fastrpc_internal_proc_timeout {
-	/* Timeout in ms */
-	__u32 timeout;
-	/* Reserved for future use */
-	__u32 reserved[FASTRPC_RPC_TIMEOUT_IOCTL_RSVD];
-};
-
-enum fastrpc_control_type {
-	FASTRPC_CONTROL_LATENCY		=	1,
-	FASTRPC_CONTROL_SMMU		=	2,
-	FASTRPC_CONTROL_KALLOC		=	3,
-	FASTRPC_CONTROL_WAKELOCK	=	4,
-	FASTRPC_CONTROL_PM		=	5,
-	/* Clean process on DSP */
-	FASTRPC_CONTROL_DSPPROCESS_CLEAN	=	6,
-	FASTRPC_CONTROL_RPC_POLL	=	7,
-	FASTRPC_CONTROL_ASYNC_WAKE	=	8,
-	FASTRPC_CONTROL_NOTIF_WAKE	=	9,
-};
-
-enum fastrpc_dspsignal_type {
-	FASTRPC_DSPSIGNAL_SIGNAL = 1,
-	FASTRPC_DSPSIGNAL_WAIT = 2,
-	FASTRPC_DSPSIGNAL_CREATE = 3,
-	FASTRPC_DSPSIGNAL_DESTROY = 4,
-	FASTRPC_DSPSIGNAL_CANCEL_WAIT = 5,
-};
-
-enum fastrpc_status_flags {
-	FASTRPC_USERPD_UP			= 0,
-	FASTRPC_USERPD_EXIT			= 1,
-	FASTRPC_USERPD_FORCE_KILL	= 2,
-	FASTRPC_USERPD_EXCEPTION	= 3,
-	FASTRPC_DSP_SSR				= 4,
-	FASTRPC_USERPD_RELEASE		= 5,
-	FASTRPC_USERPD_TIMEOUT		= 6,
-};
-
 struct fastrpc_ioctl_capability {
 	__u32 domain;
 	__u32 attribute_id;
 	__u32 capability;   /* dsp capability */
 	__u32 reserved[4];
-};
-
-enum fastrpc_perfkeys {
-	PERF_COUNT = 0,
-	PERF_RESERVED1 = 1,
-	PERF_MAP = 2,
-	PERF_COPY = 3,
-	PERF_LINK = 4,
-	PERF_GETARGS = 5,
-	PERF_PUTARGS = 6,
-	PERF_RESERVED2 = 7,
-	PERF_INVOKE = 8,
-	PERF_RESERVED3 = 9,
-	PERF_KEY_MAX = 10,
 };
 
 #endif /* __QCOM_FASTRPC_H__ */

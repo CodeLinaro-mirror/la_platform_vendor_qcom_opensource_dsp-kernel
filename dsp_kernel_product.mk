@@ -8,6 +8,6 @@ endif
 
 ifeq ($(FASTRPC_DLKM_ENABLED), true)
 ifneq ($(ENABLE_HYP), true)
-PRODUCT_PACKAGES += frpc-adsprpc.ko
+PRODUCT_PACKAGES += fastrpc-dsp.ko
 endif
 endif

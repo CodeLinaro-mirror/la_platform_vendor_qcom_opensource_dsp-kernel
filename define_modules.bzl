@@ -17,24 +17,18 @@ def define_modules(target, variant):
     trace_include_path = "../../../{}/dsp".format(native.package_name())
 
     ddk_module(
-        name = "{}_frpc-adsprpc".format(kernel_build_variant),
+        name = "{}_fastrpc-dsp".format(kernel_build_variant),
         kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
         deps = ["//msm-kernel:all_headers"],
         srcs = [
             "dsp/fastrpc.c",
-            "dsp/fastrpc_rpmsg.c",
-            "dsp/fastrpc_shared.h",
-            "dsp/fastrpc_trace.h",
-            "dsp/fastrpc_sysfs.c"
         ],
         local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
-        out = "frpc-adsprpc.ko",
+        out = "fastrpc-dsp.ko",
         hdrs = [
             "include/uapi/misc/fastrpc.h",
-            "include/linux/fastrpc.h"
         ],
         includes = [
-            "include/linux",
             "include/uapi",
         ],
     )
@@ -42,7 +36,7 @@ def define_modules(target, variant):
     copy_to_dist_dir(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
         data = [
-            ":{}_frpc-adsprpc".format(kernel_build_variant),
+            ":{}_fastrpc-dsp".format(kernel_build_variant),
         ],
         dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
         flat = True,

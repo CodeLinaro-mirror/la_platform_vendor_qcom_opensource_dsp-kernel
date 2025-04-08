@@ -43,12 +43,10 @@ KBUILD_CPPFLAGS += -DCONFIG_DSP_CANOE=1
 ccflags-y += -DCONFIG_DSP_CANOE=1
 endif
 
-LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 
-frpc-adsprpc-y := dsp/fastrpc.o	\
-			 dsp/fastrpc_rpmsg.o \
+fastrpc-dsp-y := dsp/fastrpc.o	\
 
-obj-m := frpc-adsprpc.o
+obj-m := fastrpc-dsp.o
 
-BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/frpc-adsprpc.ko
+BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/fastrpc-dsp.ko
