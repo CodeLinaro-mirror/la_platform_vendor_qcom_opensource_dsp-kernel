@@ -275,7 +275,12 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 
 	spin_lock(&fl->lock);
 		list_for_each_entry(map, &fl->maps, node) {
-			if (map->buf == buf)
+			/*
+			 * Retrieve the map if the DMA buffer and fd match. For
+			 * duplicated fds with the same DMA buffer, create separate
+			 * maps for each duplicated fd.
+			 */
+			if (map->buf == buf && map->fd == fd)
 				goto map_found;
 		}
 	goto error;
@@ -571,7 +576,7 @@ static int fastrpc_buf_alloc(struct fastrpc_user *fl,
 			return ret;
 	}
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -771,13 +776,21 @@ static int olaps_cmp(const void *a, const void *b)
 	return st == 0 ? ed : st;
 }
 
-static void fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
+static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 {
 	u64 max_end = 0;
 	int i;
+	struct device *dev = ctx->fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 
 	for (i = 0; i < ctx->nbufs; ++i) {
 		ctx->olaps[i].start = ctx->args[i].ptr;
+		/* Check the overflow for user buffer */
+		if (ctx->olaps[i].start > (ULLONG_MAX - ctx->args[i].length)) {
+			dev_dbg(dev,
+				"user passed invalid non ion buffer addr 0x%llx, size %llx\n",
+				ctx->args[i].ptr, ctx->args[i].length);
+			return -EFAULT;
+		}
 		ctx->olaps[i].end = ctx->olaps[i].start + ctx->args[i].length;
 		ctx->olaps[i].raix = i;
 	}
@@ -805,6 +818,7 @@ static void fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 			max_end = ctx->olaps[i].end;
 		}
 	}
+	return 0;
 }
 
 static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
@@ -858,7 +872,9 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 					ctx->nscalars * sizeof(*ctx->args));
 		}
 		invoke->inv.args = (__u64)ctx->args;
-		fastrpc_get_buff_overlaps(ctx);
+		ret = fastrpc_get_buff_overlaps(ctx);
+		if (ret)
+			goto err_alloc;
 	}
 
 	/* Released in fastrpc_context_put() */
@@ -1494,7 +1510,7 @@ static int fastrpc_get_meta_size(struct fastrpc_invoke_ctx *ctx)
 
 static u64 fastrpc_get_payload_size(struct fastrpc_invoke_ctx *ctx, int metalen)
 {
-	u64 size = 0;
+	u64 size = 0, len;
 	int oix;
 
 	size = ALIGN(metalen, FASTRPC_ALIGN);
@@ -1506,7 +1522,11 @@ static u64 fastrpc_get_payload_size(struct fastrpc_invoke_ctx *ctx, int metalen)
 			if (ctx->olaps[oix].offset == 0)
 				size = ALIGN(size, FASTRPC_ALIGN);
 
-			size += (ctx->olaps[oix].mend - ctx->olaps[oix].mstart);
+			len = (ctx->olaps[oix].mend - ctx->olaps[oix].mstart);
+			/* Check the overflow for payload */
+			if (size > (ULLONG_MAX - len))
+				return 0;
+			size += len;
 		}
 	}
 
@@ -1576,6 +1596,11 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	metalen = fastrpc_get_meta_size(ctx);
 	pkt_size = fastrpc_get_payload_size(ctx, metalen);
+	if (!pkt_size) {
+		dev_err(dev, "invalid payload size for handle 0x%x, sc 0x%x\n",
+			ctx->handle, ctx->sc);
+		return -EFAULT;
+	}
 
 	PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_MAP),
 	err = fastrpc_create_maps(ctx);
@@ -1622,6 +1647,14 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			rpra[i].buf.pv = (u64) ctx->args[i].ptr;
 			pages[i].addr = ctx->maps[i]->phys;
 
+			if (len > ctx->maps[i]->size) {
+				err = -EFAULT;
+				dev_err(dev,
+					"Invalid buffer addr 0x%llx len 0x%llx IPA 0x%llx size 0x%llx fd %d\n",
+					ctx->args[i].ptr, len, ctx->maps[i]->phys,
+					ctx->maps[i]->size, ctx->maps[i]->fd);
+				goto bail;
+			}
 			if (!(ctx->maps[i]->attr & FASTRPC_ATTR_NOVA)) {
 				mmap_read_lock(current->mm);
 				vma = find_vma(current->mm, ctx->args[i].ptr);
@@ -1657,11 +1690,6 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			}
 
 			mlen = ctx->olaps[oix].mend - ctx->olaps[oix].mstart;
-
-			if (mlen > LONG_MAX) {
-				dev_err(dev, "Error: invalid payload size 0x%llx\n", mlen);
-				return -EFAULT;
-			}
 
 			if (mlen > COPY_BUF_WARN_LIMIT)
 				dev_dbg(dev, "user passed non ion buffer size 0x%llx, mend 0x%llx mstart 0x%llx, sc 0x%x\n",
@@ -2775,6 +2803,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[1];
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	u64 phys = 0, size = 0;
 	char *name;
 	int err = 0;
@@ -2803,12 +2832,13 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (IS_ERR(name))
 		return PTR_ERR(name);
 
-	fl->sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_name;
 	}
+	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 	is_oispd = !strcmp(name, "oispd");
@@ -3097,9 +3127,10 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	int memlen;
 	int err = 0;
-	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
+	void *file = NULL;
 	struct {
 		int pgid;
 		u32 namelen;
@@ -3120,6 +3151,27 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				DSP_CREATE_START) != DEFAULT_PROC_STATE)
 		return -EALREADY;
 
+	/* Verify shell file passed by user */
+	if (init.filefd <= 0) {
+		if (!init.filelen || !init.file) {
+		/*In this case shell will be loaded by DSP using daemon */
+			init.file = 0;
+			init.filelen = 0;
+		} else {
+			file = kzalloc(init.filelen, GFP_KERNEL);
+			if (!file) {
+				err = -ENOMEM;
+				goto err_out;
+			}
+			if (copy_from_user(file,
+				(void *)(uintptr_t)init.file,
+				init.filelen)) {
+				err = -EFAULT;
+				dev_err(fl->cctx->dev, "copy_from_user failed for shell file\n");
+				goto err_out;
+			}
+		}
+	}
 	/*
 	 * Third-party apps don't have permission to open the fastrpc device, so
 	 * it is opened on their behalf by DSP HAL. This is detected by
@@ -3151,12 +3203,13 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (fl->is_unsigned_pd && fl->cctx->smmucb_pool)
 		fl->pd_type = USER_UNSIGNEDPD_POOL;
 
-	fl->sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_out;
 	}
+	fl->sctx = sctx;
 
 	fastrpc_get_process_gids(&fl->gidlist);
 
@@ -3214,7 +3267,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	args[1].length = inbuf.namelen;
 	args[1].fd = -1;
 
-	args[2].ptr = (u64) init.file;
+	args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
 	args[2].length = inbuf.filelen;
 	args[2].fd = init.filefd;
 
@@ -3256,6 +3309,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
 		fl->proc_init_sharedbuf = NULL;
 	}
+	kfree(file);
 
 	return 0;
 
@@ -3275,6 +3329,7 @@ err_alloc:
 		mutex_unlock(&fl->map_mutex);
 	}
 err_out:
+	kfree(file);
 	/* Reset the process state to its default in case of an error. */
 	atomic_set(&fl->state, DEFAULT_PROC_STATE);
 	return err;
@@ -3809,17 +3864,19 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 {
 	struct fastrpc_invoke_args args[1];
 	struct fastrpc_enhanced_invoke ioctl;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	int err, tgid = fl->tgid_frpc;
 
 	if (!fl->is_secure_dev) {
 		dev_err(fl->cctx->dev, "untrusted app trying to attach to privileged DSP PD\n");
 		return -EACCES;
 	}
-	fl->sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		return -EBUSY;
 	}
+	fl->sctx = sctx;
 
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.
@@ -7052,12 +7109,14 @@ void fastrpc_register_wakeup_source(struct device *dev,
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		u32 rsp_flags, u32 early_wake_time)
 {
-	if (ctx->cctx && !atomic_read(&ctx->cctx->teardown))
-		fastrpc_pm_awake(ctx->fl, ctx->cctx->secure);
+	if (ctx->cctx) {
+		if (!atomic_read(&ctx->cctx->teardown))
+			fastrpc_pm_awake(ctx->fl, ctx->cctx->secure);
+		trace_fastrpc_context_complete(ctx->cctx->domain_id, (uint64_t)ctx,
+			retval, ctx->ctxid, ctx->pid, ctx->sc);
+	}
 	ctx->retval = retval;
 	ctx->rsp_flags = (enum fastrpc_response_flags)rsp_flags;
-	trace_fastrpc_context_complete(ctx->cctx->domain_id, (uint64_t)ctx,
-			retval, ctx->ctxid, ctx->pid, ctx->sc);
 	switch (rsp_flags) {
 	case NORMAL_RESPONSE:
 	case COMPLETE_SIGNAL:
