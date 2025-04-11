@@ -84,6 +84,89 @@ struct fastrpc_common {
 /* Global fastrpc driver object */
 struct fastrpc_common g_frpc;
 
+static void fastrpc_user_release(struct kref *ref);
+
+int fastrpc_file_get(struct fastrpc_user *fl)
+{
+	return kref_get_unless_zero(&fl->refcount) ? 0 : -ENOENT;
+}
+
+void fastrpc_file_put(struct fastrpc_user *fl, bool worker)
+{
+	if (worker) {
+		struct kref *kref = &fl->refcount;
+		u32 old, new, val = atomic_read(&kref->refcount.refs);
+
+		/*
+		 * Schedule the job to a worker thread if the user-object
+		 * reference count is 1; otherwise, simply decrease the
+		 * refcount.
+		 */
+		if (val > 1 && likely(val != UINT_MAX)) {
+
+			/* Loop until the refcount is successfully decremented */
+			for (;;) {
+				new = val - 1;
+
+				/* Schedule the job to a worker thread if refcount is 1 */
+				if (val == 1)
+					goto schedule_work;
+
+				/*
+				 * Atomically compare the reference counter with "val" and
+				 * replace it with "new" only if they match. The
+				 * atomic_cmpxchg_release function always returns the
+				 * previous value. If the old value matches the expected
+				 * "val," the atomic_cmpxchg_release operation succeeds.
+				 */
+				old = atomic_cmpxchg_release(&kref->refcount.refs, val, new);
+
+				/*
+				 * Break the loop if the atomic operation was successful
+				 * to decrement the user-object refcount.
+				 */
+				if (old == val)
+					break;
+
+				/*
+				 * Update "val" with the most recent value read during
+				 * the failed atomic operation to retry.
+				 */
+				val = old;
+			}
+		} else if (val == 1) {
+			goto schedule_work;
+		}
+	} else {
+		kref_put(&fl->refcount, fastrpc_user_release);
+	}
+	return;
+schedule_work:
+
+	/*
+	 * In case the reference count is 1 for the user-object,
+	 * its release function cannot be called in an interrupt context.
+	 * So schedule the job to a worker thread.
+	 */
+	schedule_work(&fl->put_work);
+
+}
+
+/*
+ * Extracts a job from the worker and releases the user-object reference.
+ *
+ * @param work Pointer to the worker.
+ *
+ * @return None.
+ */
+static void fastrpc_file_put_worker(struct work_struct *work)
+{
+	struct fastrpc_user *fl =
+			container_of(work, struct fastrpc_user, put_work);
+
+	fastrpc_file_put(fl, false);
+}
+
 static inline int64_t getnstimediff(struct timespec64 *start)
 {
 	int64_t ns;
@@ -3648,74 +3731,9 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 }
 
 /*
- * File kref destructor function that will be invoked when the file
- *  kref is zero
- *
- * This functions cleans up the user-object of the app.
- */
-static void fastrpc_user_release(struct kref *ref)
-{
-	struct fastrpc_user *fl = container_of(ref, struct fastrpc_user, refcount);
-
-	fastrpc_user_obj_free(fl->file, NULL);
-}
-
-int fastrpc_file_get(struct fastrpc_user *fl)
-{
-	return kref_get_unless_zero(&fl->refcount) ? 0 : -ENOENT;
-}
-
-void fastrpc_file_put(struct fastrpc_user *fl, bool worker)
-{
-	if (worker) {
-		struct kref *kref = &fl->refcount;
-		u32 old, new_val, val = atomic_read(&kref->refcount.refs);
-
-		/*
-		 * Schedule the job to a worker thread if the user-object
-		 * reference count is 1; otherwise, simply decrease the
-		 * refcount.
-		 */
-		if (val > 1 && likely(val != UINT_MAX)) {
-			for (;;) {
-				new_val = val - 1;
-
-				if (val == 1)
-					goto schedule_work;
-
-				old = atomic_cmpxchg_release(&kref->refcount.refs, val, new_val);
-				if (old == val)
-					break;
-				val = old;
-			}
-		} else if (val == 1) {
-			goto schedule_work;
-		}
-	} else {
-		kref_put(&fl->refcount, fastrpc_user_release);
-	}
-	return;
-schedule_work:
-	/*
-	 * In case the reference count is 1 for the user-object,
-	 * its release function cannot be called in an interrupt context.
-	 * So schedule the job to a worker thread.
-	 */
-	schedule_work(&fl->put_work);
-}
-
-static void fastrpc_file_put_worker(struct work_struct *work)
-{
-	struct fastrpc_user *fl =
-		container_of(work, struct fastrpc_user, put_work);
-
-	fastrpc_file_put(fl, false);
-}
-
-/*
  * Free fastrpc user object of client
  *
- * @arg1 : file (NULL for default channel user)
+ * @arg1 : fastrpc_user (NULL for default channel user, non-NULL for user-apps)
  * @arg2 : channel context (NULL for user-apps, non-NULL for default user)
  *
  * This function deletes a fastrpc user object:
@@ -3725,7 +3743,7 @@ static void fastrpc_file_put_worker(struct work_struct *work)
  *
  * Returns 0 if user object is successfully removed
  */
-static int fastrpc_user_obj_free(struct file *file,
+static int fastrpc_user_obj_free(struct fastrpc_user *user,
 	struct fastrpc_channel_ctx *cctx)
 {
 	struct fastrpc_user *fl = NULL;
@@ -3738,8 +3756,8 @@ static int fastrpc_user_obj_free(struct file *file,
 	spinlock_t *glock = &g_frpc.glock;
 	int err = 0;
 
-	if (file) {
-		fl = (struct fastrpc_user *)file->private_data;
+	if (user) {
+		fl = user;
 		cctx = fl->cctx;
 	} else {
 		fl = (struct fastrpc_user *)cctx->default_user;
@@ -3891,13 +3909,12 @@ skip_user_cleanup:
 	mutex_destroy(&fl->map_mutex);
 	kfree(fl);
 
-	if (file) {
+	if (user) {
 		spin_lock_irqsave(&cctx->lock, flags);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 
 		fastrpc_channel_ctx_put(cctx);
-		file->private_data = NULL;
 	} else {
 		/*
 		 * Default user-object will be deleted only when the last
@@ -3910,10 +3927,23 @@ skip_user_cleanup:
 }
 
 /*
+ * File kref destructor function that will be invoked when the file
+ *  kref is zero
+ *
+ * This functions cleans up the user-object of the app.
+ */
+static void fastrpc_user_release(struct kref *ref)
+{
+	struct fastrpc_user *fl = container_of(ref, struct fastrpc_user, refcount);
+
+	fastrpc_user_obj_free(fl, NULL);
+}
+
+/*
  * Callback function that will be invoked when user-app closes the
  * fastrpc device node.
  *
- * This functions cleans up the user-object of the app.
+ * This function decrements the user-object refcount.
  */
 static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
@@ -3969,7 +3999,6 @@ static int fastrpc_user_obj_create(struct file *filp,
 		/* Released in fastrpc_device_release() */
 		fastrpc_channel_ctx_get(cctx);
 
-		fl->file = filp;
 		filp->private_data = fl;
 	}
 
@@ -3983,6 +4012,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	INIT_LIST_HEAD(&fl->maps);
 	INIT_LIST_HEAD(&fl->mmaps);
 	INIT_LIST_HEAD(&fl->user);
+	INIT_LIST_HEAD(&fl->active_user_ssr);
 	INIT_LIST_HEAD(&fl->cached_bufs);
 	INIT_LIST_HEAD(&fl->notif_queue);
 	INIT_LIST_HEAD(&fl->fastrpc_drivers);
@@ -4256,19 +4286,29 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 	bool is_process_found = false;
 	unsigned long irq_flags = 0;
 	struct fastrpc_user *user;
+	int err;
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(user, &cctx->users, user) {
+		err = fastrpc_file_get(user);
+		if (err) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, user);
+			continue;
+		}
 		if (user->tgid_frpc == notif->pid) {
 			is_process_found = true;
 			break;
 		}
+		fastrpc_file_put(user, true);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	if (!is_process_found)
 		return;
+
 	fastrpc_queue_pd_status(user, domain, notif->status, user->sessionid);
+	fastrpc_file_put(user, true);
 }
 
 static int fastrpc_wait_on_notif_queue(
@@ -6190,18 +6230,26 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 				 unsigned long arg)
 {
 	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
-	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_channel_ctx *cctx;
 	char __user *argp = (char __user *)arg;
 	int err;
 	int process_init = 0;
 	unsigned long flags = 0;
 
+	err = fastrpc_file_get(fl);
+	if (err) {
+		dev_err(fl->cctx->dev, "%s : Failed to get user-obj for %s, fl (%pK)\n",
+				__func__, current->comm, fl);
+		return err;
+	}
+	cctx = fl->cctx;
 	fastrpc_channel_ctx_get(cctx);
 	spin_lock_irqsave(&cctx->lock, flags);
 	if (atomic_read(&cctx->teardown)) {
 		/* If subsystem already going thru SSR, then fail ioctl immediately */
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		fastrpc_channel_ctx_put(cctx);
+		fastrpc_file_put(fl, false);
 		return -EPIPE;
 	}
 	/*
@@ -6271,6 +6319,7 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 	fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_channel_ctx_put(fl->cctx);
+	fastrpc_file_put(fl, false);
 	return err;
 }
 
@@ -6357,6 +6406,13 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 		spin_unlock_irqrestore(glock, irq_flags);
 		return err;
 	}
+	err = fastrpc_file_get(fl);
+	if (err) {
+		pr_err("%s : Failed to get user-obj for fl (%pK)\n",
+				__func__, fl);
+		spin_unlock_irqrestore(glock, irq_flags);
+		return err;
+	}
 	cctx = fl->cctx;
 	fastrpc_channel_ctx_get(cctx);
 	fl->is_dma_invoke_pend = true;
@@ -6433,6 +6489,7 @@ error:
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
+	fastrpc_file_put(fl, false);
 	return err;
 }
    /*
@@ -6471,6 +6528,13 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 	if (!fl) {
 		err = -EBADF;
 		pr_err("%s : bad fl ", __func__);
+		spin_unlock_irqrestore(glock, irq_flags);
+		return err;
+	}
+	err = fastrpc_file_get(fl);
+	if (err) {
+		pr_err("%s : Failed to get user-obj for fl (%pK)\n",
+				__func__, fl);
 		spin_unlock_irqrestore(glock, irq_flags);
 		return err;
 	}
@@ -6542,6 +6606,7 @@ error:
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
+	fastrpc_file_put(fl, false);
 	return err;
 }
    /*
@@ -6579,6 +6644,13 @@ long fastrpc_dev_get_hlos_pid(struct fastrpc_device *dev,
 		spin_unlock_irqrestore(glock, irq_flags);
 		return err;
 	}
+	err = fastrpc_file_get(fl);
+	if (err) {
+		pr_err("%s: Failed to get user-obj for fl (%pK)\n",
+				__func__, fl);
+		spin_unlock_irqrestore(glock, irq_flags);
+		return err;
+	}
 	cctx = fl->cctx;
 	fastrpc_channel_ctx_get(cctx);
 
@@ -6586,7 +6658,7 @@ long fastrpc_dev_get_hlos_pid(struct fastrpc_device *dev,
 	p.hpid->hlos_pid = fl->tgid;
 	spin_unlock_irqrestore(glock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
-
+	fastrpc_file_put(fl, false);
 	return err;
 }
    /*
@@ -6760,9 +6832,16 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 
 		spin_lock_irqsave(&cctx->lock, irq_flags);
 		list_for_each_entry(user, &cctx->users, user) {
+			err = fastrpc_file_get(user);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, user);
+				continue;
+			}
 			if (user->tgid_frpc == frpc_driver->handle) {
 				goto process_found;
 			}
+			fastrpc_file_put(user, false);
 		}
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	}
@@ -6774,6 +6853,7 @@ process_found:
 	if(user->device->dev_close) {
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 		pr_err("%s : process already exited", __func__);
+		fastrpc_file_put(user, false);
 		return -ESRCH;
 	}
 
@@ -6783,7 +6863,7 @@ process_found:
 	/* Execute the probe fn. of the client driver if matching process found */
 	frpc_driver->probe(user->device);
 	pr_info("fastrpc driver registered with handle 0x%x\n", frpc_driver->handle);
-
+	fastrpc_file_put(user, false);
 	return err;
 }
 EXPORT_SYMBOL_GPL(fastrpc_driver_register);
@@ -6825,11 +6905,19 @@ static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
 {
 	struct fastrpc_user *fl;
 	unsigned long flags;
+	int err;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry(fl, &cctx->users, user) {
+		err = fastrpc_file_get(fl);
+		if (err) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, fl);
+			continue;
+		}
 		if (fl->servloc_name && !strcmp(servloc_name, fl->servloc_name))
 			fastrpc_notify_users(fl);
+		fastrpc_file_put(fl, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 }
@@ -6883,7 +6971,8 @@ static inline void populate_dump_metadata(struct fastrpc_dump_info *entry,
 	entry->phys = addr;
 }
 
-void frpc_coredump(struct fastrpc_channel_ctx *cctx)
+void frpc_coredump(struct fastrpc_channel_ctx *cctx,
+	struct list_head *active_users_list)
 {
 	int iter = 0, err = 0;
 	bool scm_done = false;
@@ -6907,7 +6996,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx)
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
-	list_for_each_entry_safe(user, n, &cctx->users, user) {
+	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
 		if (user->init_mem)
 			total_size += user->init_mem->size;
@@ -6947,7 +7036,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx)
 	}
 	s_file->size = DBG_FS_SIZE;
 
-	list_for_each_entry_safe(user, n, &cctx->users, user) {
+	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		s_file->private = user;
 		if ((dump + total_size) - pos >= DBG_FS_SIZE)
 			s_file->buf = pos;
@@ -7488,6 +7577,12 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(fl, &cctx->users, user) {
+		err = fastrpc_file_get(fl);
+		if (err) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, fl);
+			continue;
+		}
 		if (fl->tgid_frpc == pid && atomic_read(&fl->state) < DSP_EXIT_START) {
 			err = fastrpc_file_get(fl);
 			if (err) {
@@ -7498,6 +7593,7 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 			process_found = true;
 			break;
 		}
+		fastrpc_file_put(fl, true);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 

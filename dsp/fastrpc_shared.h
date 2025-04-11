@@ -1053,7 +1053,6 @@ struct fastrpc_user {
 	struct list_head mdctxs;
 
 	struct fastrpc_channel_ctx *cctx;
-	struct file *file;
 
 	/* Context bank(s) used for all regular buffer mappings */
 	struct fastrpc_pool_ctx *sctx;
@@ -1143,6 +1142,9 @@ struct fastrpc_user {
 	atomic_t state;
 	/* Timeout in ms */
 	uint32_t timeout;
+
+	/* Node for adding this user-object to active-users list during ssr */
+	struct list_head active_user_ssr;
 	struct kref refcount;
 	struct work_struct put_work;
 };
