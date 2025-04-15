@@ -2186,6 +2186,10 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 		 */
 		if (ctx->handle > FASTRPC_MAX_STATIC_HANDLE &&
 			cctx->domain->type == FASTRPC_NSP && fl->timeout) {
+			/*
+			 * User has specified an rpc timeout. So wait for dsp response
+			 * with that timeout.
+			 */
 			timeleft =
 				wait_for_completion_interruptible_timeout(
 					&ctx->work,
@@ -2210,8 +2214,9 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 				}
 
 				atomic_set(&fl->state, DSP_EXIT_COMPLETE);
-				interrupted = err;
+				interrupted = -ETIME;
 			} else if (timeleft < 0) {
+				/* RPC call interrupted */
 				interrupted = timeleft;
 			}
 		} else {
