@@ -88,11 +88,16 @@
 #define NUM_CHANNELS	5	/* adsp, mdsp, slpi, cdsp, cdsp1*/
 #define NUM_SESSIONS	14	/* max 11 compute, 3 cpz */
 
+#define RH_CID ADSP_DOMAIN_ID
+
 /* Default maximum sessions allowed per process */
 #define DEFAULT_MAX_SESS_PER_PROC 4
 
 #define VALID_FASTRPC_CID(cid) \
 	(cid >= ADSP_DOMAIN_ID && cid < NUM_CHANNELS)
+
+#define GET_DEV_FROM_CID(me, cid) \
+	((me->dev[cid] == NULL) ? me->dev[RH_CID] : me->dev[cid])
 
 #define REMOTE_SCALARS_LENGTH(sc)	(REMOTE_SCALARS_INBUFS(sc) +\
 					REMOTE_SCALARS_OUTBUFS(sc) +\
@@ -729,7 +734,7 @@ struct fastrpc_apps {
 	int compat;
 	struct hlist_head drivers;
 	spinlock_t hlock;
-	struct device *dev;
+	struct device *dev[NUM_CHANNELS];
 	/* Indicates fastrpc device node info */
 	struct device *dev_fastrpc;
 	unsigned int latency;
