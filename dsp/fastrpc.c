@@ -501,6 +501,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
 
+	if (!size)
+		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -3790,7 +3792,8 @@ static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
 
 	if (copy_from_user(&bp, argp, sizeof(bp)))
 		return -EFAULT;
-
+	if (!bp.size)
+		return -EFAULT;
 	if (!fl->sctx)
 		return -EINVAL;
 
@@ -3941,8 +3944,7 @@ void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, in
 
 	notif_rsp = kzalloc(sizeof(*notif_rsp), GFP_ATOMIC);
 	if (!notif_rsp) {
-		dev_err(fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev,
-							"Allocation failed for notif\n");
+		dev_err(fl->cctx->dev, "Allocation failed for notif\n");
 		return;
 	}
 
@@ -3984,7 +3986,6 @@ static int fastrpc_wait_on_notif_queue(
 	int err = 0;
 	unsigned long flags;
 	struct fastrpc_notif_rsp *notif = NULL, *inotif, *n;
-	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 
 read_notif_status:
 	err = wait_event_interruptible(fl->proc_state_notif.notif_wait_queue,
@@ -4006,7 +4007,7 @@ read_notif_status:
 		notif_rsp->domain = notif->domain;
 		notif_rsp->session = notif->session;
 	} else {// Go back to wait if ctx is invalid
-		dev_err(dev, "Invalid status notification response\n");
+		dev_err(fl->cctx->dev, "Invalid status notification response\n");
 		goto read_notif_status;
 	}
 
@@ -5035,6 +5036,42 @@ static int fastrpc_dspsignal_create(struct fastrpc_user *fl,
 	return err;
 }
 
+/* Unblock all dspsignals in pending state */
+static int fastrpc_dspsignal_cancel_all(struct fastrpc_user *fl)
+{
+	u32 i = 0, j = 0;
+	struct fastrpc_dspsignal *s = NULL;
+	struct fastrpc_dspsignal *group = NULL;
+	unsigned long irq_flags = 0;
+
+	dev_dbg(fl->cctx->dev, "%s: Cancel all signals for pid %d\n",
+			__func__, fl->tgid);
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
+	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS
+		/ FASTRPC_DSPSIGNAL_GROUP_SIZE); i++) {
+		group = fl->signal_groups[i];
+		if (!group)
+			continue;
+
+		for (j = 0; j < FASTRPC_DSPSIGNAL_GROUP_SIZE; j++) {
+			s = &group[j];
+			if (s->state == DSPSIGNAL_STATE_PENDING) {
+				s->state = DSPSIGNAL_STATE_CANCELED;
+				trace_fastrpc_dspsignal("cancel all",
+					(i * FASTRPC_DSPSIGNAL_GROUP_SIZE) + j,
+					s->state, 0);
+				complete_all(&s->comp);
+			}
+		}
+	}
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+
+	dev_dbg(fl->cctx->dev, "%s: All signals canceled for pid %d\n",
+			__func__, fl->tgid);
+	return 0;
+}
+
 static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 			      struct fastrpc_internal_dspsignal *fsig)
 {
@@ -5061,6 +5098,7 @@ static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 	}
 
 	s->state = DSPSIGNAL_STATE_UNUSED;
+	trace_fastrpc_dspsignal("destroy", signal_id, s->state, 0);
 	complete_all(&s->comp);
 
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
@@ -5519,6 +5557,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		return -EHOSTDOWN;
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (!req.size)
 		return -EFAULT;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
@@ -6494,6 +6534,8 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 			ctx->retval, ctx->pid, ctx->pid, ctx->sc);
 		complete(&ctx->work);
 	}
+
+	fastrpc_dspsignal_cancel_all(user);
 	spin_unlock(&user->lock);
 }
 
