@@ -44,3 +44,5 @@ define_modules("parrot", "gki","no")
 define_modules("lahaina", "consolidate", "no")
 
 define_modules("lahaina", "gki", "no")
+
+define_modules("lahaina", "perf", "no")
