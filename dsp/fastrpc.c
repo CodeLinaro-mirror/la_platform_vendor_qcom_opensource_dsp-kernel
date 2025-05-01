@@ -449,7 +449,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
 
-	if (!size)
+	/* Check if the size is valid (non-zero and within integer range) */
+	if (!size || size > INT_MAX)
 		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
@@ -525,7 +526,7 @@ static int fastrpc_buf_alloc(struct fastrpc_user *fl,
 			return ret;
 	}
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -1209,6 +1210,7 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 	int err = 0, sgl_index = 0;
 	struct device *dev = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct fastrpc_pool_ctx *secsctx = NULL;
 	u32 smmuidx = DEFAULT_SMMU_IDX;
 
 	if (!fastrpc_map_lookup(fl, fd, va, len, buf, mflags, ppmap, take_ref))
@@ -1248,12 +1250,13 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 
 	if (map->secure && (!(attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP))) {
 		if (!fl->secsctx) {
-			fl->secsctx = fastrpc_session_alloc(fl, true);
-			if (!fl->secsctx) {
+			secsctx = fastrpc_session_alloc(fl, true);
+			if (!secsctx) {
 				dev_err(fl->cctx->dev, "No secure session available\n");
 				err = -EBUSY;
 				goto attach_err;
 			}
+			fl->secsctx = secsctx;
 		}
 		sess = fl->secsctx;
 	} else {
@@ -1306,6 +1309,7 @@ map_retry:
 		smmuidx++;
 		goto map_retry;
 	} else if (err) {
+		mutex_unlock(&smmucb->map_mutex);
 		goto map_err;
 	}
 
@@ -2685,37 +2689,37 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 	int domain_id = -1, size = 0;
 	struct dentry *debugfs_root = g_frpc.debugfs_root;
 
+	if (atomic_cmpxchg(&fl->debugfs_file_create, 0, 1))
+		return 0;
 	memcpy(cur_comm, current->comm, TASK_COMM_LEN);
 	cur_comm[TASK_COMM_LEN-1] = '\0';
 	if (debugfs_root != NULL && fl != NULL) {
 		domain_id = fl->cctx->domain_id;
-		if (!(fl->debugfs_file_create)) {
-			size = strlen(cur_comm) + strlen("_")
-				+ COUNT_OF(current->pid) + strlen("_")
-				+ COUNT_OF(FASTRPC_DEV_MAX)
-				+ 1;
+		size = strlen(cur_comm) + strlen("_")
+			+ COUNT_OF(current->pid) + strlen("_")
+			+ COUNT_OF(fl->tgid_frpc) + strlen("_")
+			+ COUNT_OF(FASTRPC_DEV_MAX)
+			+ 1;
 
-			fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
-			if (fl->debugfs_buf == NULL) {
-				return -ENOMEM;
-			}
-			/*
-			 * Use HLOS process name, HLOS PID, unique fastrpc PID
-			 * domain_id in debugfs filename to create unique file name
-			 */
-			snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
-				cur_comm, "_", current->pid, "_",
-				fl->tgid_frpc, "_", domain_id);
-			fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
-					debugfs_root, fl, &fastrpc_debugfs_fops);
-			if (IS_ERR_OR_NULL(fl->debugfs_file)) {
-				pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
-						cur_comm, __func__, fl->debugfs_buf);
-				fl->debugfs_file = NULL;
-			}
-			kfree(fl->debugfs_buf);
-			fl->debugfs_file_create = true;
+		fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
+		if (fl->debugfs_buf == NULL) {
+			return -ENOMEM;
 		}
+		/*
+		 * Use HLOS process name, HLOS PID, unique fastrpc PID
+		 * domain_id in debugfs filename to create unique file name
+		 */
+		snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
+			cur_comm, "_", current->pid, "_",
+			fl->tgid_frpc, "_", domain_id);
+		fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
+			debugfs_root, fl, &fastrpc_debugfs_fops);
+		if (IS_ERR_OR_NULL(fl->debugfs_file)) {
+			pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
+					cur_comm, __func__, fl->debugfs_buf);
+			fl->debugfs_file = NULL;
+		}
+		kfree(fl->debugfs_buf);
 	}
 return 0;
 }
@@ -2730,6 +2734,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[1];
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	u64 phys = 0, size = 0;
 	char *name;
 	int err = 0;
@@ -2758,12 +2763,13 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (IS_ERR(name))
 		return PTR_ERR(name);
 
-	fl->sctx = fastrpc_session_alloc(fl, false);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_name;
 	}
+	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 	is_oispd = !strcmp(name, "oispd");
@@ -3052,6 +3058,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	int memlen;
 	int err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
@@ -3127,12 +3134,14 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (fl->is_unsigned_pd && fl->cctx->smmucb_pool)
 		fl->pd_type = USER_UNSIGNEDPD_POOL;
 
-	fl->sctx = fastrpc_session_alloc(fl, false);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_out;
 	}
+	fl->sctx = sctx;
+
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
@@ -3486,6 +3495,7 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	mutex_destroy(&fl->signal_create_mutex);
 	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
+	mutex_destroy(&fl->pm_qos_mutex);
 	spin_lock_irqsave(glock, irq_flags);
 	kfree(fl);
 
@@ -3525,6 +3535,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	mutex_init(&fl->map_mutex);
 	spin_lock_init(&fl->dspsignals_lock);
 	mutex_init(&fl->signal_create_mutex);
+	mutex_init(&fl->pm_qos_mutex);
 	INIT_LIST_HEAD(&fl->pending);
 	INIT_LIST_HEAD(&fl->interrupted);
 	INIT_LIST_HEAD(&fl->maps);
@@ -3663,17 +3674,19 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 {
 	struct fastrpc_invoke_args args[1];
 	struct fastrpc_enhanced_invoke ioctl;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	int err, tgid = fl->tgid_frpc;
 
 	if (!fl->is_secure_dev) {
 		dev_err(fl->cctx->dev, "untrusted app trying to attach to privileged DSP PD\n");
 		return -EACCES;
 	}
-	fl->sctx = fastrpc_session_alloc(fl, false);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		return -EBUSY;
 	}
+	fl->sctx = sctx;
 
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.
@@ -3856,7 +3869,7 @@ static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 tim
 static int fastrpc_internal_control(struct fastrpc_user *fl,
 					struct fastrpc_internal_control *cp)
 {
-	int err = 0, ret = 0;
+	int err = 0;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
 	unsigned long flags = 0;
@@ -3886,28 +3899,30 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 		 * id 0. If DT property 'qcom,single-core-latency-vote' is enabled
 		 * then add voting request for only one core of cluster id 0.
 		 */
+		 mutex_lock(&fl->pm_qos_mutex);
 		 for (cpu = 0; cpu < cctx->lowest_capacity_core_count; cpu++) {
 			if (!fl->qos_request) {
-				ret = dev_pm_qos_add_request(
+				err = dev_pm_qos_add_request(
 						get_cpu_device(cpu),
 						&fl->dev_pm_qos_req[cpu],
 						DEV_PM_QOS_RESUME_LATENCY,
 						latency);
 			} else {
-				ret = dev_pm_qos_update_request(
+				err = dev_pm_qos_update_request(
 						&fl->dev_pm_qos_req[cpu],
 						latency);
 			}
-			if (ret < 0) {
+			if (err < 0) {
 				dev_err(fl->cctx->dev, "QoS with lat %u failed for CPU %d, err %d, req %d\n",
 					latency, cpu, err, fl->qos_request);
 				break;
 			}
 		}
-		if (ret >= 0) {
+		if (err >= 0) {
 			fl->qos_request = 1;
 			err = 0;
 		}
+		mutex_unlock(&fl->pm_qos_mutex);
 		break;
 	case FASTRPC_CONTROL_SMMU:
 		fl->sharedcb = cp->smmu.sharedcb;
@@ -5577,7 +5592,7 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	return -ESRCH;
 
 process_found:
-	if(user->device->dev_close) {
+	if(atomic_read(&user->state) >= DSP_EXIT_START) {
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 		pr_err("%s : process already exited", __func__);
 		return -ESRCH;

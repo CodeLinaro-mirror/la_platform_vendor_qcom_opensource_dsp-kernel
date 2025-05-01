@@ -834,7 +834,7 @@ struct fastrpc_user {
 	 */
 	struct fastrpc_device *device;
 #ifdef CONFIG_DEBUG_FS
-	bool debugfs_file_create;
+	atomic_t debugfs_file_create;
 	struct dentry *debugfs_file;
 	char *debugfs_buf;
 #endif
@@ -872,6 +872,8 @@ struct fastrpc_user {
 	/*mutex for process maps synchronization*/
 	struct mutex map_mutex;
 	struct mutex signal_create_mutex;
+	/* mutex for qos request synchronization */
+	struct mutex pm_qos_mutex;
 	/* Compleation object for dma invocations by client driver*/
 	struct completion dma_invoke;
 	/* Completion objects and state for dspsignals */
