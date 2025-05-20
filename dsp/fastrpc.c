@@ -34,7 +34,6 @@
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
-#include <linux/remoteproc.h>
 
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
@@ -74,6 +73,9 @@ struct fastrpc_common {
 
 	/* global list of multidomain context ids */
 	struct idr mdctx_idr;
+
+	/* Flag to check if the kernel is in trusted VM */
+	bool is_trusted_vm;
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
@@ -140,54 +142,50 @@ static inline struct fastrpc_channel_ctx
 	return domain ? domain->cctx : NULL;
 }
 
-/*
- * Retrieves the fastrpc ssr handler for a given Logical domain ID.
- *
- * @param domain_id Logical domain id of channel context
- *
- * @return A pointer to the fastrpc ssr handler for the
- *         specified domain or NULL if the domain is not found.
- */
-static inline struct fastrpc_ssr_handler
-	*fastrpc_get_ssr_handler(int domain_id)
+void __dma_buf_unmap_attachment_wrap(struct dma_buf_attachment *attach,
+	struct sg_table *table)
 {
-	struct fastrpc_domain *domain =
-		fastrpc_lookup_domain_in_table(domain_id, false);
-	return domain ? &domain->ssr_handler : NULL;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0))
+	dma_buf_unmap_attachment_unlocked(attach, table, DMA_BIDIRECTIONAL);
+#else
+	dma_buf_unmap_attachment(attach, table, DMA_BIDIRECTIONAL);
+#endif
 }
 
 static void dma_buf_unmap_attachment_wrap(struct fastrpc_map *map)
 {
 	trace_fastrpc_dma_unmap(map->fl->cctx->domain_id, map->phys,
 		map->size, map->fd);
+
+	__dma_buf_unmap_attachment_wrap(map->attach, map->table);
+}
+
+struct sg_table *__dma_buf_map_attachment_wrap(struct dma_buf_attachment *attach)
+{
+	struct sg_table *table;
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0))
-	dma_buf_unmap_attachment_unlocked(map->attach, map->table,
+	table = dma_buf_map_attachment_unlocked(attach,
 		DMA_BIDIRECTIONAL);
 #else
-	dma_buf_unmap_attachment(map->attach, map->table,
+	table = dma_buf_map_attachment(attach,
 		DMA_BIDIRECTIONAL);
 #endif
+
+	return table;
 }
+
 static int dma_buf_map_attachment_wrap(struct fastrpc_map *map)
 {
 	int err = 0;
 	struct sg_table *table;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0))
-	table = dma_buf_map_attachment_unlocked(map->attach,
-		DMA_BIDIRECTIONAL);
+	table = __dma_buf_map_attachment_wrap(map->attach);
 	if (IS_ERR(table)) {
 		err = PTR_ERR(table);
 		return err;
 	}
-#else
-	table = dma_buf_map_attachment(map->attach,
-		DMA_BIDIRECTIONAL);
-	if (IS_ERR(table)) {
-		err = PTR_ERR(table);
-		return err;
-	}
-#endif
+
 	map->table = table;
 
 	return 0;
@@ -358,14 +356,12 @@ static bool fastrpc_get_persistent_buf(struct fastrpc_user *fl,
 	return found;
 }
 
-static void __fastrpc_dma_buf_free(struct fastrpc_buf *buf)
+static inline void fastrpc_dma_buf_free(struct fastrpc_buf *buf)
 {
-	uint32_t sid_pos = (buf->smmucb ? buf->smmucb->sid_pos :
-							DSP_DEFAULT_BUS_WIDTH);
-
 	trace_fastrpc_dma_free(buf->domain_id, buf->phys, buf->size);
-	dma_free_coherent(buf->dev, buf->size, buf->virt,
-		IOVA_TO_PHYSADDR(buf->phys, sid_pos));
+
+	__fastrpc_dma_buf_free(buf);
+
 	kfree(buf);
 }
 
@@ -375,13 +371,13 @@ static void __fastrpc_buf_free(struct fastrpc_buf *buf)
 
 	/* REMOTEHEAP_BUF is not mapped on SMMU device */
 	if (buf->type == REMOTEHEAP_BUF) {
-		__fastrpc_dma_buf_free(buf);
+		fastrpc_dma_buf_free(buf);
 	} else {
 		smmucb = buf->smmucb;
 		mutex_lock(&smmucb->map_mutex);
 		if (smmucb->dev) {
 			smmucb->allocatedbytes -= SMMU_ALIGN(buf->size);
-			__fastrpc_dma_buf_free(buf);
+			fastrpc_dma_buf_free(buf);
 		}
 		mutex_unlock(&smmucb->map_mutex);
 	}
@@ -509,10 +505,26 @@ static void fastrpc_rootheap_buf_list_free(struct fastrpc_channel_ctx *cctx)
 	} while (free);
 }
 
-static inline void __fastrpc_dma_alloc(struct fastrpc_buf *buf)
+static inline int fastrpc_dma_alloc(struct fastrpc_buf *buf)
 {
-	buf->virt = dma_alloc_coherent(buf->dev, buf->size,
-				(dma_addr_t *)&buf->phys, GFP_KERNEL);
+	struct fastrpc_smmu *smmucb = buf->smmucb;
+	int err = 0;
+
+	if (!buf->dev)
+		return -EINVAL;
+
+	err = __fastrpc_dma_alloc(buf);
+	if (err)
+		return err;
+
+	if (buf->type == REMOTEHEAP_BUF)
+		return 0;
+
+	smmucb->allocatedbytes += SMMU_ALIGN(buf->size);
+	RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
+		buf->phys, smmucb->sid_pos);
+
+	return 0;
 }
 
 static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
@@ -521,6 +533,7 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 {
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
+	int err = 0;
 
 	if (!size)
 		return -EFAULT;
@@ -548,23 +561,16 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 		 * Do not acquire spinlock with IRQ disabled
 		 * as "dma_alloc_coherent" locks a mutex
 		 */
-		if (fl->cctx->dev)
-			__fastrpc_dma_alloc(buf);
+		err = fastrpc_dma_alloc(buf);
 	} else {
 		buf->dev = smmucb->dev;
 		buf->smmucb = smmucb;
 		mutex_lock(&smmucb->map_mutex);
-		if (smmucb->dev)
-			__fastrpc_dma_alloc(buf);
-		if (buf->virt) {
-			smmucb->allocatedbytes += SMMU_ALIGN(buf->size);
-			RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
-				buf->phys, smmucb->sid_pos);
-		}
+		err = fastrpc_dma_alloc(buf);
 		mutex_unlock(&smmucb->map_mutex);
 	}
 
-	if (!buf->virt) {
+	if (err) {
 		mutex_destroy(&buf->lock);
 		kfree(buf);
 		return -ENOMEM;
@@ -696,7 +702,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 	kfree(cctx);
 }
 
-static void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx)
+void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx)
 {
 	kref_get(&cctx->refcount);
 }
@@ -1266,11 +1272,10 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	 *	- Since it is a secure environment by default, there are no explicit "secure" buffers
 	 *	- All buffers are marked "non-secure"
 	 */
-#if IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
-	map->secure = 0;
-#else
-	map->secure = (exclusive_access) ? 0 : 1;
-#endif
+	if (g_frpc.is_trusted_vm)
+		map->secure = 0;
+	else
+		map->secure = (exclusive_access) ? 0 : 1;
 
 	return err;
 }
@@ -2016,119 +2021,6 @@ static int poll_for_remote_response(struct fastrpc_invoke_ctx *ctx, u32 timeout)
 	return err;
 }
 
-/*
- * Callback function for kernel worker thread to trigger dsp ssr in case
- * of a timeout of a kernel rpc call
- */
-static void fastrpc_handle_ssr_request(struct work_struct *work)
-{
-	int rc = 0;
-	struct fastrpc_ssr_handler *ssr_handler =
-		container_of(work, struct fastrpc_ssr_handler, ssr_work);
-	void *rphandle = ssr_handler->rphandle;
-
-	if (!rphandle) {
-		pr_err("Error: %s: invalid rproc handle for domain %d\n",
-			__func__, ssr_handler->domain_id);
-		goto bail;
-	}
-
-	/* Shut down DSP */
-	rc = rproc_shutdown(rphandle);
-	if (rc) {
-		pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
-			__func__, rc, rphandle);
-		goto bail;
-	}
-
-	/* Reboot DSP */
-	rc = rproc_boot(rphandle);
-	if (rc) {
-		pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
-			__func__, rc, rphandle);
-		goto bail;
-	}
-	pr_info("%s : SSR completed successfully", __func__);
-
-bail:
-	return;
-}
-
-/*
- * Callback function invoked when the timer for a kernel rpc call expires
- *
- * If kernel rpc call times out, it indicates that the dsp is potentially
- * in an irrecoverable state as fastrpc on rootpd is unresponsive. So,
- * trigger an ssr on the dsp
- */
-
-static void ssr_timer_callback(struct timer_list *timer)
-{
-	struct fastrpc_channel_ctx *cctx = NULL;
-	unsigned long flags;
-	void *rphandle = NULL;
-	struct fastrpc_ssr_handler *ssr_handler = NULL;
-	struct fastrpc_invoke_ctx *ctx =
-		container_of(timer, struct fastrpc_invoke_ctx, ssr_timer);
-
-	if (!ctx) {
-		pr_err("Error: %s: invoke ctx is null\n", __func__);
-		return;
-	}
-
-	cctx = ctx->fl->cctx;
-	if (!cctx) {
-		pr_err("Error: %s channel ctx is null for handle 0x%x, sc 0x%x, pid %d, tid %d\n",
-			__func__, ctx->handle, ctx->sc, ctx->tgid, ctx->pid);
-		return;
-	}
-
-	fastrpc_channel_ctx_get(cctx);
-	spin_lock_irqsave(&cctx->lock, flags);
-
-	/* Ensure that ssr is triggered only once for a channel */
-	if (cctx->startshutdown)
-		goto bail;
-	else
-		cctx->startshutdown = true;
-
-	if (cctx->rpdev && !atomic_read(&cctx->teardown)) {
-		/* Get remote processor handle associated with device */
-		rphandle = rproc_get_by_child(&cctx->rpdev->dev);
-		if (!rphandle) {
-			pr_err("Error: %s: rproc_get_by_child failed for domain %d\n",
-				__func__, cctx->domain_id);
-			goto bail;
-		}
-	} else {
-		pr_err("Error: %s: channel already down for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
-			__func__, cctx->domain_id, ctx->handle, ctx->sc,
-			ctx->tgid, ctx->pid);
-		goto bail;
-	}
-
-	ssr_handler = fastrpc_get_ssr_handler(cctx->domain_id);
-	if (!ssr_handler) {
-		pr_err("Error: %s: failed to get ssr handler for domain %d\n",
-			__func__, cctx->domain_id);
-		goto bail;
-	}
-
-	ssr_handler->domain_id = cctx->domain_id;
-
-	spin_unlock_irqrestore(&cctx->lock, flags);
-	fastrpc_channel_ctx_put(cctx);
-
-	/* Launch kernel worker thread to trigger ssr */
-	ssr_handler->rphandle = rphandle;
-	INIT_WORK(&ssr_handler->ssr_work, fastrpc_handle_ssr_request);
-	schedule_work(&ssr_handler->ssr_work);
-	return;
-
-bail:
-	spin_unlock_irqrestore(&cctx->lock, flags);
-	fastrpc_channel_ctx_put(cctx);
-}
 
 static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 						u32 kernel)
@@ -2151,7 +2043,7 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 		if (cctx->domain->type == FASTRPC_NSP &&
 			(fl->pd_type == USERPD ||
 			fl->pd_type == USER_UNSIGNEDPD_POOL) &&
-			fl->dsp_recovery &&
+			fl->dsp_recovery && !g_frpc.is_trusted_vm &&
 			!atomic_read(&cctx->teardown)) {
 			/*
 			 * Start timer that will trigger ssr when kernel rpc
@@ -2187,6 +2079,10 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 		 */
 		if (ctx->handle > FASTRPC_MAX_STATIC_HANDLE &&
 			cctx->domain->type == FASTRPC_NSP && fl->timeout) {
+			/*
+			 * User has specified an rpc timeout. So wait for dsp response
+			 * with that timeout.
+			 */
 			timeleft =
 				wait_for_completion_interruptible_timeout(
 					&ctx->work,
@@ -2211,8 +2107,9 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 				}
 
 				atomic_set(&fl->state, DSP_EXIT_COMPLETE);
-				interrupted = err;
+				interrupted = -ETIME;
 			} else if (timeleft < 0) {
+				/* RPC call interrupted */
 				interrupted = timeleft;
 			}
 		} else {
@@ -2589,7 +2486,7 @@ reject_session:
 
 static int fastrpc_get_process_gids(struct gid_list *gidlist)
 {
-	struct group_info *group_info = get_current_groups();
+	struct group_info *group_info = current_cred()->group_info;
 	int i, num_gids;
 	u32 *gids = NULL;
 
@@ -3814,6 +3711,9 @@ static int fastrpc_user_obj_free(struct file *file,
 	debugfs_remove(fl->debugfs_file);
 #endif
 
+	if (g_frpc.is_trusted_vm)
+		fastrpc_unreserve_dma_heap(fl->tvm_dma_heap);
+
 skip_user_cleanup:
 	fastrpc_free_user(fl);
 
@@ -3878,6 +3778,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	struct fastrpc_device_node *fdevice;
 	struct fastrpc_user *fl = NULL;
 	unsigned long flags;
+	struct fastrpc_tvm_dma_heap *tvm_dma_heap = NULL;
 	int err;
 
 	if (filp) {
@@ -3948,6 +3849,14 @@ static int fastrpc_user_obj_create(struct file *filp,
 		spin_lock_irqsave(&cctx->lock, flags);
 		list_add_tail(&fl->user, &cctx->users);
 		spin_unlock_irqrestore(&cctx->lock, flags);
+
+		if (g_frpc.is_trusted_vm) {
+			err = fastrpc_reserve_dma_heap(&tvm_dma_heap);
+			if (err)
+				goto error;
+		}
+
+		fl->tvm_dma_heap = tvm_dma_heap;
 	} else {
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;
@@ -7852,6 +7761,13 @@ static int fastrpc_init(void)
 		platform_driver_unregister(&fastrpc_cb_driver);
 		return ret;
 	}
+
+#if IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
+	g_frpc.is_trusted_vm = true;
+#else
+	g_frpc.is_trusted_vm = false;
+#endif
+
 #ifdef CONFIG_DEBUG_FS
 	debugfs_root = debugfs_create_dir("fastrpc", NULL);
 	if (IS_ERR_OR_NULL(debugfs_root)) {
@@ -7882,4 +7798,8 @@ static void fastrpc_exit(void)
 module_exit(fastrpc_exit);
 
 MODULE_LICENSE("GPL v2");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("DMA_BUF");
+#else
 MODULE_IMPORT_NS(DMA_BUF);
+#endif
