@@ -3876,6 +3876,9 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		fastrpc_session_free(cctx, fl->sctx);
 	if (fl->secsctx)
 		fastrpc_session_free(cctx, fl->secsctx);
+	if (fl->extctx)
+		fastrpc_session_free(cctx, fl->extctx);
+
 	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
 	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS /FASTRPC_DSPSIGNAL_GROUP_SIZE); i++)
 		kfree(fl->signal_groups[i]);
