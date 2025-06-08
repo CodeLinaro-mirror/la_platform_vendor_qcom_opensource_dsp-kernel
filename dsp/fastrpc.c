@@ -1846,8 +1846,18 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		list[i].num = ctx->args[i].length ? 1 : 0;
 		list[i].pgidx = i;
 		if (ctx->maps[i]) {
-			pages[i].addr = ctx->maps[i]->phys;
-			pages[i].size = ctx->maps[i]->size;
+			/* It is possible that map is created using mflag
+			 * is FASTRPC_MAP_LEGACY_DMA_HANDLE and take_ref
+			 * is false. Check if map is still exist or is
+			 * being freed as take_ref is false
+			 */
+			mutex_lock(&ctx->fl->map_mutex);
+			if (!fastrpc_map_lookup(ctx->fl, ctx->args[i].fd,
+				 0, 0, NULL, 0 , &ctx->maps[i], false)) {
+				pages[i].addr = ctx->maps[i]->phys;
+				pages[i].size = ctx->maps[i]->size;
+			}
+			mutex_unlock(&ctx->fl->map_mutex);
 		}
 		rpra[i].dma.fd = ctx->args[i].fd;
 		rpra[i].dma.len = ctx->args[i].length;
@@ -2569,7 +2579,7 @@ reject_session:
 
 static int fastrpc_get_process_gids(struct gid_list *gidlist)
 {
-	struct group_info *group_info = get_current_groups();
+	struct group_info *group_info = current_cred()->group_info;
 	int i, num_gids;
 	u32 *gids = NULL;
 
@@ -3607,13 +3617,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fl->init_mem = NULL;
 	}
 
-	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	// During process tear down free the map, even if refcount is non-zero
 	list_for_each_entry_safe(map, m, &fl->maps, node)
 		__fastrpc_free_map(map);
 	mutex_unlock(&fl->map_mutex);
-	mutex_unlock(&fl->remote_map_mutex);
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
 
@@ -3810,8 +3818,8 @@ skip_user_cleanup:
 	fastrpc_free_user(fl);
 
 	mutex_destroy(&fl->signal_create_mutex);
-	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
+	mutex_destroy(&fl->pm_qos_mutex);
 	kfree(fl);
 
 	if (user) {
@@ -3909,10 +3917,10 @@ static int fastrpc_user_obj_create(struct file *filp,
 	}
 
 	spin_lock_init(&fl->lock);
-	mutex_init(&fl->remote_map_mutex);
 	mutex_init(&fl->map_mutex);
 	spin_lock_init(&fl->dspsignals_lock);
 	mutex_init(&fl->signal_create_mutex);
+	mutex_init(&fl->pm_qos_mutex);
 	INIT_LIST_HEAD(&fl->pending);
 	INIT_LIST_HEAD(&fl->interrupted);
 	INIT_LIST_HEAD(&fl->maps);
@@ -3986,7 +3994,6 @@ static int fastrpc_user_obj_create(struct file *filp,
 
 	return 0;
 error:
-	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->signal_create_mutex);
 	kfree(fl);
@@ -4368,7 +4375,7 @@ static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 tim
 static int fastrpc_internal_control(struct fastrpc_user *fl,
 					struct fastrpc_internal_control *cp)
 {
-	int err = 0, ret = 0;
+	int err = 0;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
 
@@ -4397,28 +4404,30 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 		 * id 0. If DT property 'qcom,single-core-latency-vote' is enabled
 		 * then add voting request for only one core of cluster id 0.
 		 */
+		 mutex_lock(&fl->pm_qos_mutex);
 		 for (cpu = 0; cpu < cctx->lowest_capacity_core_count; cpu++) {
 			if (!fl->qos_request) {
-				ret = dev_pm_qos_add_request(
+				err = dev_pm_qos_add_request(
 						get_cpu_device(cpu),
 						&fl->dev_pm_qos_req[cpu],
 						DEV_PM_QOS_RESUME_LATENCY,
 						latency);
 			} else {
-				ret = dev_pm_qos_update_request(
+				err = dev_pm_qos_update_request(
 						&fl->dev_pm_qos_req[cpu],
 						latency);
 			}
-			if (ret < 0) {
+			if (err < 0) {
 				dev_err(fl->cctx->dev, "QoS with lat %u failed for CPU %d, err %d, req %d\n",
 					latency, cpu, err, fl->qos_request);
 				break;
 			}
 		}
-		if (ret >= 0) {
+		if (err >= 0) {
 			fl->qos_request = 1;
 			err = 0;
 		}
+		mutex_unlock(&fl->pm_qos_mutex);
 		break;
 	case FASTRPC_CONTROL_SMMU:
 		fl->sharedcb = cp->smmu.sharedcb;
@@ -6020,7 +6029,7 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 	return 0;
 
 err_assign:
-	err = fastrpc_req_munmap_impl(fl, buf);
+	err = fastrpc_req_munmap_dsp(fl, buf->raddr, buf->size);
 	if (err) {
 		if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 			spin_lock_irqsave(&fl->cctx->lock, flags);
@@ -6257,14 +6266,10 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		err = fastrpc_dmabuf_alloc(fl, argp);
 		break;
 	case FASTRPC_IOCTL_MMAP:
-		mutex_lock(&fl->remote_map_mutex);
 		err = fastrpc_req_mmap(fl, argp);
-		mutex_unlock(&fl->remote_map_mutex);
 		break;
 	case FASTRPC_IOCTL_MUNMAP:
-		mutex_lock(&fl->remote_map_mutex);
 		err = fastrpc_req_munmap(fl, argp);
-		mutex_unlock(&fl->remote_map_mutex);
 		break;
 	case FASTRPC_IOCTL_MEM_MAP:
 		err = fastrpc_req_mem_map(fl, argp);
@@ -6408,7 +6413,6 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	/* Map DMA buffer on SMMU device*/
-	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	err = fastrpc_map_create(fl, -1, 0, p.map->buf,
 				p.map->size, p.map->attrs,
@@ -6457,7 +6461,6 @@ error:
 		fl->is_dma_invoke_pend = false;
 	}
 	if (is_cnt_updated) {
-		mutex_unlock(&fl->remote_map_mutex);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
@@ -6531,8 +6534,6 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 		is_cnt_updated = true;
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
-
-	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	err = fastrpc_map_lookup(fl, -1, 0, 0, p.unmap->buf,
 				ADSP_MMAP_DMA_BUFFER, &map, false);
@@ -6574,7 +6575,6 @@ error:
 		fl->is_dma_invoke_pend = false;
 	}
 	if (is_cnt_updated) {
-		mutex_unlock(&fl->remote_map_mutex);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
@@ -6850,9 +6850,11 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 		/*
 		 * After audio or ois PDR, skip notifying the pending kill call,
 		 * as the DSP guestOS may still be processing and might result
-		 * improper access issues.
+		 * improper access issues. But in case of SSR cleanup pending
+                 * kill calls as well.
 		 */
-		if (atomic_read(&fl->state) >= DSP_EXIT_START && IS_PDR(fl) &&
+		if (atomic_read(&fl->state) >= DSP_EXIT_START &&
+                        !IS_SSR(fl) && IS_PDR(fl) &&
 			fl->pd_type != SENSORS_STATICPD &&
 			ctx->msg.handle == FASTRPC_INIT_HANDLE)
 			continue;
@@ -7977,4 +7979,8 @@ static void fastrpc_exit(void)
 module_exit(fastrpc_exit);
 
 MODULE_LICENSE("GPL v2");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("DMA_BUF");
+#else
 MODULE_IMPORT_NS(DMA_BUF);
+#endif
