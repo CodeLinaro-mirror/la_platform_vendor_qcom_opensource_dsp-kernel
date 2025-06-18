@@ -59,7 +59,7 @@ static inline int get_cid_from_rpdev(struct rpmsg_device *rpdev)
 		cid = ADSP_DOMAIN_ID;
 	else if (!strcmp(label, "slpi"))
 		cid = SDSP_DOMAIN_ID;
-	else if (!strcmp(label, "mdsp"))
+	else if (!strcmp(label, "mdsp") || !strcmp(label, "modem"))
 		cid = MDSP_DOMAIN_ID;
 	else if (!strcmp(label, "cdsp1"))
 		cid = CDSP1_DOMAIN_ID;
