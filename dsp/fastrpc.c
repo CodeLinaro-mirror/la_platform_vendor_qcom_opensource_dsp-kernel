@@ -3261,10 +3261,14 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_pool_ctx *sess = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
-	const unsigned int ROOTHEAP_BUF_SIZE = (1280 * 1024),
-			NUM_ROOTHEAP_BUFS = 3;
 	int err = 0;
 	unsigned long flags = 0;
+	const unsigned int ROOTHEAP_BUF_SIZE =
+		(cctx->rootheap_buf_size != 0) ? cctx->rootheap_buf_size :
+		FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE;
+	const unsigned int NUM_ROOTHEAP_BUFS =
+		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
+		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
 
 	/* Allocate buffer only if DSP supports growing of rootheap */
 	if (!cctx->dsp_attributes[ROOTPD_RPC_HEAP_SUPPORT] ||
@@ -3368,7 +3372,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_init_create init;
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
-	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
+	struct fastrpc_phy_page pages[NUM_PAGES_WITH_MAP_DEBUG_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -3501,6 +3505,27 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (err)
 		goto err_alloc;
 
+	/*
+	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
+	 * Process spawn should not fail if unable to alloc debug log buffer
+	 */
+	if (fl->cctx->dsp_attributes[DBGLOGBUF_SUPPORT]) {
+		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
+				MAP_DEBUG_BUF, &fl->dbglogbuf);
+		if (err) {
+			if (fl->dbglogbuf) {
+				fastrpc_buf_free(fl->dbglogbuf, false);
+				fl->dbglogbuf = NULL;
+			}
+			dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate dbglogbuf buffer size %d\n",
+				err, __func__, DBGLOGBUF_SIZE);
+		} else {
+			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
+			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
+			inbuf.pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+		}
+	}
+
 	fl->init_mem = imem;
 	args[0].ptr = (u64)(uintptr_t)&inbuf;
 	args[0].length = sizeof(inbuf);
@@ -3570,6 +3595,10 @@ err_alloc:
 		mutex_lock(&fl->map_mutex);
 		fastrpc_map_put(configmap);
 		mutex_unlock(&fl->map_mutex);
+	}
+	if (fl->dbglogbuf) {
+		fastrpc_buf_free(fl->dbglogbuf, false);
+		fl->dbglogbuf = NULL;
 	}
 err_out:
 	kfree(file);
@@ -3654,6 +3683,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	if (fl->pers_hdr_buf) {
 		fastrpc_buf_free(fl->pers_hdr_buf, false);
 		fl->pers_hdr_buf = NULL;
+	}
+
+	if (fl->dbglogbuf) {
+		fastrpc_buf_free(fl->dbglogbuf, false);
+		fl->dbglogbuf = NULL;
 	}
 
 	if (fl->hdr_bufs) {
@@ -3777,6 +3811,19 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 			__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
 		BUG_ON(1);
 	}
+
+	/*
+	 * Stop resource cleanup by waiting if error is -EIO,
+	 * channel context teardown is not occurring, and device is about to crash.
+	 */
+	if (err == -EIO && !atomic_read(&cctx->teardown)
+		&& fastrpc_is_device_crashing(cctx)) {
+		pr_info("%s process %s is waiting, err %d  (tgid %d, tgid_frpc %d)\n",
+			__func__, current->comm, err, fl->tgid_app, fl->tgid_frpc);
+		/* Wait for rpmsg removal to start or a device crash */
+		wait_for_completion(&cctx->rpmsg_remove_start);
+	}
+
 	atomic_set(&fl->state, DSP_EXIT_COMPLETE);
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3829,8 +3876,13 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		fastrpc_session_free(cctx, fl->sctx);
 	if (fl->secsctx)
 		fastrpc_session_free(cctx, fl->secsctx);
+	if (fl->extctx)
+		fastrpc_session_free(cctx, fl->extctx);
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
 	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS /FASTRPC_DSPSIGNAL_GROUP_SIZE); i++)
 		kfree(fl->signal_groups[i]);
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove(fl->debugfs_file);
