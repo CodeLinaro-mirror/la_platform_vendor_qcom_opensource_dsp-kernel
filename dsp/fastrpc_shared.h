@@ -162,6 +162,8 @@
 #define ADSP_MMAP_ADD_PAGES_LLC 0x3000
 /* Map persistent header buffer on DSP */
 #define ADSP_MMAP_PERSIST_HDR  0x4000
+/* Size of dbglogbuf to log map/unmap calls on DSP*/
+#define DBGLOGBUF_SIZE (1*1024*1024)
 
 
 /* Fastrpc attribute for no mapping of fd  */
@@ -218,10 +220,12 @@
  *     Page 2 : proc attrs debug buf
  *     Page 3 : rootheap buf
  *     Page 4 : proc_init shared buf
+ *     Page 5 : map debug log buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
 #define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
+#define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -242,6 +246,10 @@
 /* CPU feature information to DSP */
 #define FASTRPC_CPUINFO_DEFAULT (0)
 #define FASTRPC_CPUINFO_EARLY_WAKEUP (1)
+
+/* Default root heap buffer size and count */
+#define FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE (0x140000)
+#define FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT (3)
 
 /* Position of priority in frpc tid for glink msg packet */
 #define PRIORITY_POS_IN_FRPC_TID 26
@@ -450,6 +458,7 @@ enum fastrpc_internal_attributes {
 	/* DMA handle reverse RPC support */
 	DMA_HANDLE_REVERSE_RPC_CAP = 129,
 	ROOTPD_RPC_HEAP_SUPPORT = 132,
+	DBGLOGBUF_SUPPORT = 134,
 };
 
 enum fastrpc_remote_domains_id {
@@ -466,6 +475,8 @@ enum fastrpc_remote_domains_id {
 	USER_BUF,
 	REMOTEHEAP_BUF,
 	ROOTHEAP_BUF,
+	/* Buffer to log DSP map/unmap debug info*/
+	MAP_DEBUG_BUF,
 };
 
 /* Types of RPC calls to DSP */
@@ -886,6 +897,12 @@ struct fastrpc_channel_ctx {
 	u32 iova_format;
 	/* Default user object for making kernel-to-rootpd rpc calls */
 	struct fastrpc_user *default_user;
+	/* Root heap buffer size */
+	unsigned int rootheap_buf_size;
+	/* Root heap buffer count */
+	unsigned int rootheap_buf_count;
+	/* Completion object for the threads to wait for device to crash */
+	struct completion rpmsg_remove_start;
 };
 
 struct fastrpc_ssr_handler {
@@ -1089,6 +1106,8 @@ struct fastrpc_user {
 	struct fastrpc_static_pd *spd;
 	/* Pre-allocated buffer divided into N chunks */
 	struct fastrpc_buf *hdr_bufs;
+	/* dbglogbuf to log DSP map/unmap debug info */
+	struct fastrpc_buf *dbglogbuf;
 	/*
 	 * Unique device struct for each process, shared with
 	 * client drivers when attached to fastrpc driver.
@@ -1138,7 +1157,6 @@ struct fastrpc_user {
 	/*mutex for process maps synchronization*/
 	struct mutex map_mutex;
 	struct mutex signal_create_mutex;
-	struct gid_list gidlist;
 	/* mutex for qos request synchronization */
 	struct mutex pm_qos_mutex;
 	/* Compleation object for dma invocations by client driver*/
@@ -1381,5 +1399,18 @@ int fastrpc_file_get(struct fastrpc_user *fl);
  * @return: None
  */
 void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
+
+/*
+ * fastrpc_is_device_crashing - Determine if the device is about to crash
+ *
+ * This function obtains the remoteproc handle, checks its status, and
+ * determines whether the device is in a crashing state.
+ *
+ * @cctx: Pointer to the fastrpc_channel_ctx structure.
+ *
+ * @return: True if the remoteproc state indicates a crash with recovery
+ *			disabled, otherwise false.
+ */
+bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
 
 #endif /* __FASTRPC_SHARED_H__ */

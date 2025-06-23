@@ -1321,6 +1321,18 @@ static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access)
 	int vmids_list_len = 0;
 	*exclusive_access = false;
 
+	/*
+	 * If buf lacks the Qualcomm extension of mem-buf,
+	 * No support for accesing by vm related function.
+	 * Make exclusive access as true to select non-secure smmu cb.
+	 * And bypass following vm related functions.
+	 */
+	if (!is_mem_buf_dma_buf(buf))
+	{
+		*exclusive_access = true;
+		return 0;
+	}
+
 	err = mem_buf_dma_buf_get_vmperm(buf, &vmids_list, &perms, &vmids_list_len);
 	if (err)
 		return err;
@@ -1631,8 +1643,12 @@ static u64 fastrpc_get_payload_size(struct fastrpc_invoke_ctx *ctx, int metalen)
 
 		if (ctx->args[i].fd == 0 || ctx->args[i].fd == -1) {
 
-			if (ctx->olaps[oix].offset == 0)
+			if (ctx->olaps[oix].offset == 0) {
+				/* Check for overflow before align. */
+				if (size > (ULLONG_MAX - (FASTRPC_ALIGN - 1)))
+					return 0;
 				size = ALIGN(size, FASTRPC_ALIGN);
+			}
 
 			len = (ctx->olaps[oix].mend - ctx->olaps[oix].mstart);
 			/* Check the overflow for payload */
@@ -2608,17 +2624,30 @@ static int fastrpc_get_process_gids(struct gid_list *gidlist)
 static void fastrpc_check_privileged_process(struct fastrpc_user *fl,
 				struct fastrpc_init_create *init)
 {
-	u32 gid = sorted_lists_intersection(fl->gidlist.gids,
-			fl->gidlist.gidcount, fl->cctx->gidlist.gids,
-			fl->cctx->gidlist.gidcount);
+	struct gid_list gidlist = {0};
+	u32 gid;
 
 	/* disregard any privilege bits from userspace */
 	init->attrs &= (~FASTRPC_MODE_PRIVILEGED);
+
+	if (fastrpc_get_process_gids(&gidlist)) {
+		dev_info(fl->cctx->dev, "%s failed to get gidlist\n",
+				__func__);
+		return;
+	}
+
+	gid = sorted_lists_intersection(gidlist.gids,
+			gidlist.gidcount, fl->cctx->gidlist.gids,
+			fl->cctx->gidlist.gidcount);
+
+
 	if (gid) {
 		dev_info(fl->cctx->dev, "%s: %s (PID %d, GID %u) is a privileged process\n",
 				__func__, current->comm, current->tgid, gid);
 		init->attrs |= FASTRPC_MODE_PRIVILEGED;
 	}
+	/* Free memory for gid allocated in fastrpc_get_process_gids */
+	kfree(gidlist.gids);
 }
 
 static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct fastrpc_buf *buf)
@@ -3232,10 +3261,14 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_pool_ctx *sess = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
-	const unsigned int ROOTHEAP_BUF_SIZE = (1280 * 1024),
-			NUM_ROOTHEAP_BUFS = 3;
 	int err = 0;
 	unsigned long flags = 0;
+	const unsigned int ROOTHEAP_BUF_SIZE =
+		(cctx->rootheap_buf_size != 0) ? cctx->rootheap_buf_size :
+		FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE;
+	const unsigned int NUM_ROOTHEAP_BUFS =
+		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
+		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
 
 	/* Allocate buffer only if DSP supports growing of rootheap */
 	if (!cctx->dsp_attributes[ROOTPD_RPC_HEAP_SUPPORT] ||
@@ -3339,7 +3372,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_init_create init;
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
-	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
+	struct fastrpc_phy_page pages[NUM_PAGES_WITH_MAP_DEBUG_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -3428,8 +3461,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	}
 	fl->sctx = sctx;
 
-	fastrpc_get_process_gids(&fl->gidlist);
-
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
@@ -3474,6 +3505,27 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
 	if (err)
 		goto err_alloc;
+
+	/*
+	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
+	 * Process spawn should not fail if unable to alloc debug log buffer
+	 */
+	if (fl->cctx->dsp_attributes[DBGLOGBUF_SUPPORT]) {
+		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
+				MAP_DEBUG_BUF, &fl->dbglogbuf);
+		if (err) {
+			if (fl->dbglogbuf) {
+				fastrpc_buf_free(fl->dbglogbuf, false);
+				fl->dbglogbuf = NULL;
+			}
+			dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate dbglogbuf buffer size %d\n",
+				err, __func__, DBGLOGBUF_SIZE);
+		} else {
+			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
+			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
+			inbuf.pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+		}
+	}
 
 	fl->init_mem = imem;
 	args[0].ptr = (u64)(uintptr_t)&inbuf;
@@ -3544,6 +3596,10 @@ err_alloc:
 		mutex_lock(&fl->map_mutex);
 		fastrpc_map_put(configmap);
 		mutex_unlock(&fl->map_mutex);
+	}
+	if (fl->dbglogbuf) {
+		fastrpc_buf_free(fl->dbglogbuf, false);
+		fl->dbglogbuf = NULL;
 	}
 err_out:
 	kfree(file);
@@ -3628,6 +3684,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	if (fl->pers_hdr_buf) {
 		fastrpc_buf_free(fl->pers_hdr_buf, false);
 		fl->pers_hdr_buf = NULL;
+	}
+
+	if (fl->dbglogbuf) {
+		fastrpc_buf_free(fl->dbglogbuf, false);
+		fl->dbglogbuf = NULL;
 	}
 
 	if (fl->hdr_bufs) {
@@ -3751,6 +3812,19 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 			__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
 		BUG_ON(1);
 	}
+
+	/*
+	 * Stop resource cleanup by waiting if error is -EIO,
+	 * channel context teardown is not occurring, and device is about to crash.
+	 */
+	if (err == -EIO && !atomic_read(&cctx->teardown)
+		&& fastrpc_is_device_crashing(cctx)) {
+		pr_info("%s process %s is waiting, err %d  (tgid %d, tgid_frpc %d)\n",
+			__func__, current->comm, err, fl->tgid_app, fl->tgid_frpc);
+		/* Wait for rpmsg removal to start or a device crash */
+		wait_for_completion(&cctx->rpmsg_remove_start);
+	}
+
 	atomic_set(&fl->state, DSP_EXIT_COMPLETE);
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3766,7 +3840,6 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	kfree(fl->gidlist.gids);
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	atomic_add(1, &fl->proc_state_notif.notif_queue_count);
@@ -3804,8 +3877,10 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		fastrpc_session_free(cctx, fl->sctx);
 	if (fl->secsctx)
 		fastrpc_session_free(cctx, fl->secsctx);
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
 	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS /FASTRPC_DSPSIGNAL_GROUP_SIZE); i++)
 		kfree(fl->signal_groups[i]);
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove(fl->debugfs_file);

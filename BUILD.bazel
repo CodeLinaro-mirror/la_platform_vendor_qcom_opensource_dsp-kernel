@@ -60,3 +60,7 @@ define_modules("canoe", "consolidate")
 define_modules("alor", "perf")
 
 define_modules("alor", "consolidate")
+
+define_modules("x1p42100", "perf")
+
+define_modules("x1p42100", "consolidate")
