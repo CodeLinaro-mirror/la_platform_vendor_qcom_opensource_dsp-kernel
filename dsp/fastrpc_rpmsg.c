@@ -26,7 +26,7 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 					char *service_name, char *service_path, int spd_session);
 void fastrpc_register_wakeup_source(struct device *dev,
 	const char *client_name, struct wakeup_source **device_wake_source);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
 void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
 void frpc_coredump(struct fastrpc_channel_ctx *cctx);
 
@@ -452,7 +452,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	dev_info(cctx->dev, "Closing rpmsg channel for %s", cctx->domain->name);
 	kfree(cctx->gidlist.gids);
 	of_platform_depopulate(&rpdev->dev);
-	fastrpc_mmap_remove_ssr(cctx, false);
+	fastrpc_mmap_remove_ssr(cctx);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
 	cctx->domain = NULL;
