@@ -1243,6 +1243,15 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		 *    session pd_type, else pd_type check is ignored
 		 */
 		isess = &cctx->session[i];
+
+		/*
+		 * If the extended-map context bank supports SID sharing, then
+		 * allow client-apps requesting extended mapping to share that
+		 * context bank.
+		 */
+		if (isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb)
+			sharedcb = true;
+
 		if ((isess->usecount == 0 || isess->smmucount > 1) &&
 			isess->smmucb[DEFAULT_SMMU_IDX].valid &&
 			isess->secure == secure &&
@@ -3002,37 +3011,37 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 	int domain_id = -1, size = 0;
 	struct dentry *debugfs_root = g_frpc.debugfs_root;
 
+	if (atomic_cmpxchg(&fl->debugfs_file_create, 0, 1))
+		return 0;
 	memcpy(cur_comm, current->comm, TASK_COMM_LEN);
 	cur_comm[TASK_COMM_LEN-1] = '\0';
 	if (debugfs_root != NULL) {
 		domain_id = fl->cctx->domain_id;
-		if (!(fl->debugfs_file_create)) {
-			size = strlen(cur_comm) + strlen("_")
-				+ COUNT_OF(current->pid) + strlen("_")
-				+ COUNT_OF(domain_id)
-				+ 1;
+		size = strlen(cur_comm) + strlen("_")
+			+ COUNT_OF(current->pid) + strlen("_")
+			+ COUNT_OF(fl->tgid_frpc) + strlen("_")
+			+ COUNT_OF(domain_id)
+			+ 1;
 
-			fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
-			if (fl->debugfs_buf == NULL) {
-				return -ENOMEM;
-			}
-			/*
-			 * Use HLOS process name, HLOS PID, unique fastrpc PID
-			 * domain_id in debugfs filename to create unique file name
-			 */
-			snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
-				cur_comm, "_", current->pid, "_",
-				fl->tgid_frpc, "_", domain_id);
-			fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
-					debugfs_root, fl, &fastrpc_debugfs_fops);
-			if (IS_ERR_OR_NULL(fl->debugfs_file)) {
-				pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
-						cur_comm, __func__, fl->debugfs_buf);
-				fl->debugfs_file = NULL;
-			}
-			kfree(fl->debugfs_buf);
-			fl->debugfs_file_create = true;
+		fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
+		if (fl->debugfs_buf == NULL) {
+			return -ENOMEM;
 		}
+		/*
+		 * Use HLOS process name, HLOS PID, unique fastrpc PID
+		 * domain_id in debugfs filename to create unique file name
+		 */
+		snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
+			cur_comm, "_", current->pid, "_",
+			fl->tgid_frpc, "_", domain_id);
+		fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
+			debugfs_root, fl, &fastrpc_debugfs_fops);
+		if (IS_ERR_OR_NULL(fl->debugfs_file)) {
+			pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
+					cur_comm, __func__, fl->debugfs_buf);
+			fl->debugfs_file = NULL;
+		}
+		kfree(fl->debugfs_buf);
 	}
 return 0;
 }
@@ -4289,17 +4298,16 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(user, &cctx->users, user) {
-		err = fastrpc_file_get(user);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, user);
-			continue;
-		}
 		if (user->tgid_frpc == notif->pid) {
+			err = fastrpc_file_get(user);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, user);
+				break;
+			}
 			is_process_found = true;
 			break;
 		}
-		fastrpc_file_put(user, true);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
@@ -6881,16 +6889,15 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 
 		spin_lock_irqsave(&cctx->lock, irq_flags);
 		list_for_each_entry(user, &cctx->users, user) {
-			err = fastrpc_file_get(user);
-			if (err) {
-				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-					__func__, user);
-				continue;
-			}
 			if (user->tgid_frpc == frpc_driver->handle) {
+				err = fastrpc_file_get(user);
+				if (err) {
+					dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+						__func__, user);
+					break;
+				}
 				goto process_found;
 			}
-			fastrpc_file_put(user, false);
 		}
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	}
@@ -6958,19 +6965,11 @@ static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
 {
 	struct fastrpc_user *fl;
 	unsigned long flags;
-	int err;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		err = fastrpc_file_get(fl);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
-			continue;
-		}
 		if (fl->servloc_name && !strcmp(servloc_name, fl->servloc_name))
 			fastrpc_notify_users(fl);
-		fastrpc_file_put(fl, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 }
@@ -7620,17 +7619,16 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		err = fastrpc_file_get(fl);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
-			continue;
-		}
-		if (fl->tgid_frpc == pid && atomic_read(&fl->state) < DSP_EXIT_START) {
+		if (fl->tgid_frpc == pid) {
+			err = fastrpc_file_get(fl);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, fl);
+				break;
+			}
 			process_found = true;
 			break;
 		}
-		fastrpc_file_put(fl, true);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
