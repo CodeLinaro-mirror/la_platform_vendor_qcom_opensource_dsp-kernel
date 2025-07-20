@@ -1283,28 +1283,40 @@ static void fastrpc_session_free(struct fastrpc_channel_ctx *cctx,
 	spin_unlock_irqrestore(&cctx->lock, flags);
 }
 
-static void fastrpc_pm_awake(struct fastrpc_user *fl)
+static void fastrpc_pm_awake(struct fastrpc_user *fl,
+					u32 is_secure_channel)
 {
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
-	struct wakeup_source *wake_source = cctx->wake_source;
+	struct wakeup_source *wake_source = NULL;
 
 	/*
 	 * Vote with PM to abort any suspend in progress and
 	 * keep system awake for specified timeout
 	 */
+	if (is_secure_channel)
+		wake_source = cctx->wake_source_secure;
+	else
+		wake_source = cctx->wake_source;
+
 	if (wake_source)
 		pm_wakeup_ws_event(wake_source, fl->ws_timeout, true);
 }
 
-static void fastrpc_pm_relax(struct fastrpc_user *fl)
+static void fastrpc_pm_relax(struct fastrpc_user *fl,
+					u32 is_secure_channel)
 {
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
-	struct wakeup_source *wake_source = cctx->wake_source;
+	struct wakeup_source *wake_source = NULL;
 
 	if (!fl->wake_enable)
 		return;
 
 	mutex_lock(&cctx->wake_mutex);
+	if (is_secure_channel)
+		wake_source = cctx->wake_source_secure;
+	else
+		wake_source = cctx->wake_source;
+
 	if (wake_source)
 		__pm_relax(wake_source);
 	mutex_unlock(&cctx->wake_mutex);
@@ -3868,7 +3880,7 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		}
 	}
 	kfree(fl->dev_pm_qos_req);
-	fastrpc_pm_relax(fl);
+	fastrpc_pm_relax(fl,cctx->secure);
 	if (fl->sctx)
 		fastrpc_session_free(cctx, fl->sctx);
 	if (fl->secsctx)
@@ -4522,7 +4534,7 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 		else
 			fl->ws_timeout = cp->pm.timeout;
 		mutex_lock(&cctx->wake_mutex);
-		fastrpc_pm_awake(fl);
+		fastrpc_pm_awake(fl, fl->cctx->secure);
 		mutex_unlock(&cctx->wake_mutex);
 		break;
 	case FASTRPC_CONTROL_DSPPROCESS_CLEAN:
@@ -7563,7 +7575,7 @@ static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 {
 	if (ctx->cctx) {
 		if (!atomic_read(&ctx->cctx->teardown))
-			fastrpc_pm_awake(ctx->fl);
+			fastrpc_pm_awake(ctx->fl, ctx->cctx->secure);
 		trace_fastrpc_context_complete(ctx->cctx->domain_id, (uint64_t)ctx,
 			retval, ctx->ctxid, ctx->pid, ctx->sc);
 	}
