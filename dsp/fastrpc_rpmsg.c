@@ -17,6 +17,7 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/delay.h>
 #include <linux/remoteproc.h>
+#include <linux/rpmsg/qcom_glink.h>
 
 void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
 void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
@@ -524,19 +525,26 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	cctx->staticpd_status = false;
 
 	list_for_each_entry_safe(user, n, &cctx->users, user) {
-		err = fastrpc_file_get(user);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, user);
-			continue;
-		}
-
 		/*
-		 * Add active user-objects to a dedicated active_users_list to
-		 * avoid access to the objects which are in the device release
-		 * process. Utilize active_users_list for core dumps.
+		 * Ensure atomic_read(&user->state) == DSP_CREATE_COMPLETE before
+		 * taking a reference which make sure the process state remains stable
+		 * during teardown. All state change occurs under the same lock.
 		 */
-		list_add_tail(&user->active_user_ssr, &active_users_list);
+		if (atomic_read(&user->state) == DSP_CREATE_COMPLETE) {
+			err = fastrpc_file_get(user);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, user);
+				continue;
+			}
+
+			/*
+			 * Add active user-objects to a dedicated active_users_list to
+			 * avoid access to the objects which are in the device release
+			 * process. Utilize active_users_list for core dumps.
+			 */
+			list_add_tail(&user->active_user_ssr, &active_users_list);
+		}
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	complete_all(&cctx->rpmsg_remove_start);
@@ -608,8 +616,13 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 				  int len, void *priv, u32 addr)
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
+	bool is_glink_wakeup = false;
 
-	return fastrpc_handle_rpc_response(cctx, data, len);
+#if IS_ENABLED(CONFIG_RPMSG_QCOM_GLINK_SMEM)
+	is_glink_wakeup = qcom_glink_is_wakeup(true);
+#endif
+
+	return fastrpc_handle_rpc_response(cctx, data, len, is_glink_wakeup);
 }
 
 static const struct of_device_id fastrpc_rpmsg_of_match[] = {
