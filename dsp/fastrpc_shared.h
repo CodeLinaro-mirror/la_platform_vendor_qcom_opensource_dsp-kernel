@@ -35,7 +35,7 @@
 #define CDSP_DOMAIN_ID (3)
 #define CDSP1_DOMAIN_ID (4)
 #define NUM_LEGACY_ID_MAX	5 /* adsp, mdsp, slpi, cdsp, cdsp1 */
-#define FASTRPC_MAX_SESSIONS	14
+#define FASTRPC_MAX_SESSIONS	50
 #define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
 
 /* Check if given domain id is valid */
@@ -1114,7 +1114,7 @@ struct fastrpc_user {
 	 */
 	struct fastrpc_device *device;
 #ifdef CONFIG_DEBUG_FS
-	bool debugfs_file_create;
+	atomic_t debugfs_file_create;
 	struct dentry *debugfs_file;
 	char *debugfs_buf;
 #endif
@@ -1128,6 +1128,8 @@ struct fastrpc_user {
 	int tgid_frpc;
 	/* Actual hlos pid of process offloading to dsp */
 	int tgid_app;
+	/* Process name of process offloading to dsp */
+	char name[TASK_COMM_LEN];
 	/* PD type of remote subsystem process */
 	u32 pd_type;
 	/* total cached buffers */
@@ -1237,7 +1239,8 @@ struct fastrpc_dspsignal {
 int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint32_t rpc_msg_size);
 int fastrpc_transport_init(void);
 void fastrpc_transport_deinit(void);
-int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, int len);
+int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
+				int len, bool is_glink_wakeup);
 void ssr_timer_callback(struct timer_list *timer);
 
 /*
