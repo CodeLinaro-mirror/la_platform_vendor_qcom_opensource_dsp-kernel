@@ -34,7 +34,7 @@
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
-
+#include <linux/version.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
 
@@ -892,9 +892,23 @@ static int olaps_cmp(const void *a, const void *b)
 	return st == 0 ? ed : st;
 }
 
+/**
+ * fastrpc_get_buff_overlaps - Detect and handle buffer overlaps in RPC args
+ * @ctx: The invoke context containing buffer information
+ *
+ * This function detects overlapping memory regions in the RPC arguments and
+ * adjusts the memory mapping accordingly. It handles ION and non-ION buffers
+ * separately to prevent incorrect overlap detection between different buf types.
+ * For each buffer type:
+ * - If a buffer overlaps with a previous buffer of the same type, it adjusts
+ *   the mapping to avoid the overlap
+ * - If no overlap is detected, it uses the full buffer range
+ *
+ * Return: 0 on success, error code on failure
+ */
 static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 {
-	u64 max_end = 0;
+	u64 ion_buf_end_pos = 0, non_ion_buf_end_pos = 0;
 	int i;
 	struct device *dev = ctx->fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 
@@ -914,24 +928,29 @@ static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 	sort(ctx->olaps, ctx->nbufs, sizeof(*ctx->olaps), olaps_cmp, NULL);
 
 	for (i = 0; i < ctx->nbufs; ++i) {
-		/* Falling inside previous range */
-		if (ctx->olaps[i].start < max_end) {
-			ctx->olaps[i].mstart = max_end;
-			ctx->olaps[i].mend = ctx->olaps[i].end;
-			ctx->olaps[i].offset = max_end - ctx->olaps[i].start;
+		/* Separate ION and non-ION buffers; fd <= 0 indicates non-ION */
+		u64 *last_buf_end = (ctx->args[ctx->olaps[i].raix].fd <= 0) ?
+				&non_ion_buf_end_pos : &ion_buf_end_pos;
 
-			if (ctx->olaps[i].end > max_end) {
-				max_end = ctx->olaps[i].end;
+		if (ctx->olaps[i].start < *last_buf_end) {
+			/* Overlap detected within same buffer type */
+			ctx->olaps[i].mstart = *last_buf_end;
+			ctx->olaps[i].mend = ctx->olaps[i].end;
+			ctx->olaps[i].offset = *last_buf_end - ctx->olaps[i].start;
+
+			if (ctx->olaps[i].end > *last_buf_end) {
+				*last_buf_end = ctx->olaps[i].end;
 			} else {
 				ctx->olaps[i].mend = 0;
 				ctx->olaps[i].mstart = 0;
 			}
 
 		} else  {
+			/* No overlap, assign full range */
 			ctx->olaps[i].mend = ctx->olaps[i].end;
 			ctx->olaps[i].mstart = ctx->olaps[i].start;
 			ctx->olaps[i].offset = 0;
-			max_end = ctx->olaps[i].end;
+			*last_buf_end = ctx->olaps[i].end;
 		}
 	}
 	return 0;
@@ -2180,9 +2199,13 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 
 		if (is_timer_set) {
 			// Delete timer after ssr callback is completed
+			#if (KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE)
 			if (!del_timer_sync(&ctx->ssr_timer))
+				 interrupted = -ETIME;
+			#else
+			if (!timer_delete_sync(&ctx->ssr_timer))
 				interrupted = -ETIME;
-
+			#endif
 			dev_dbg(cctx->dev,
 				"%s: deleted timer for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
 				__func__, cctx->domain_id, ctx->handle,
@@ -4027,7 +4050,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->cctx = cctx;
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
-	fl->dsp_recovery = true;
+	fl->dsp_recovery = false;
 
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
@@ -7563,7 +7586,7 @@ void fastrpc_register_wakeup_source(struct device *dev,
 {
 	struct wakeup_source *wake_source = NULL;
 
-	wake_source = wakeup_source_register(dev, client_name);
+	wake_source = wakeup_source_register(NULL, client_name);
 	if (IS_ERR_OR_NULL(wake_source)) {
 		dev_err(dev, "wakeup_source_register failed for dev %s, client %s with err %ld\n",
 		dev_name(dev), client_name, PTR_ERR(wake_source));
