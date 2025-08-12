@@ -8,7 +8,13 @@ load(
     "ddk_module",
     "kernel_module",
     "kernel_modules_install",
+    "kernel_module_group",
 )
+
+microxr_kernel_build = select({
+    "//build/kernel/kleaf:microxr_kernel_build_true": True,
+    "//build/kernel/kleaf:microxr_kernel_build_false": False,
+})
 
 def define_modules(target, variant):
     kernel_build_variant = "{}_{}".format(target, variant)
@@ -18,7 +24,10 @@ def define_modules(target, variant):
 
     ddk_module(
         name = "{}_frpc-adsprpc".format(kernel_build_variant),
-        kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
+        kernel_build = select({
+            "//build/kernel/kleaf:microxr_kernel_build_true": "//:target_kernel_build",
+            "//build/kernel/kleaf:microxr_kernel_build_false": "//msm-kernel:{}".format(kernel_build_variant)
+        }),
         deps = ["//msm-kernel:all_headers"],
         srcs = [
             "dsp/adsprpc.c",
@@ -42,11 +51,23 @@ def define_modules(target, variant):
 
     ddk_module(
         name = "{}_cdsp-loader".format(kernel_build_variant),
-        kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
+        kernel_build = select({
+            "//build/kernel/kleaf:microxr_kernel_build_true": "//:target_kernel_build",
+            "//build/kernel/kleaf:microxr_kernel_build_false": "//msm-kernel:{}".format(kernel_build_variant)
+        }),
         deps = ["//msm-kernel:all_headers"],
         srcs = ["dsp/cdsp-loader.c"],
         out = "cdsp-loader.ko",
     )
+
+    if microxr_kernel_build:
+        kernel_module_group(
+            name = "{}_modules".format(kernel_build_variant),
+            srcs = [
+                ":{}_frpc-adsprpc".format(kernel_build_variant),
+                ":{}_cdsp-loader".format(kernel_build_variant),
+            ],
+        )
 
     copy_to_dist_dir(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
