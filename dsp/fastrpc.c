@@ -2933,6 +2933,21 @@ void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
 }
 
+void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
+{
+	seq_printf(s_file,"%s %2s %s\n", "process_name", ":", fl->name);
+	seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
+	seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
+	seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
+	seq_printf(s_file,"%s %3s %d\n", "num_pers_hdrs", ":", fl->num_pers_hdrs);
+	seq_printf(s_file,"%s %2s %d\n", "num_cached_buf", ":", fl->num_cached_buf);
+	seq_printf(s_file,"%s %5s %d\n", "wake_enable", ":", fl->wake_enable);
+	seq_printf(s_file,"%s %2s %d\n",  "is_unsigned_pd", ":", fl->is_unsigned_pd);
+	seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
+	seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
+	seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
+}
+
 static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 {
 	struct fastrpc_user *fl = s_file->private;
@@ -2951,17 +2966,7 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			return 0;
 		}
 
-		seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
-		seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
-		seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
-		seq_printf(s_file,"%s %3s %d\n", "num_pers_hdrs", ":", fl->num_pers_hdrs);
-		seq_printf(s_file,"%s %2s %d\n", "num_cached_buf", ":", fl->num_cached_buf);
-		seq_printf(s_file,"%s %5s %d\n", "wake_enable", ":", fl->wake_enable);
-		seq_printf(s_file,"%s %2s %d\n",  "is_unsigned_pd", ":", fl->is_unsigned_pd);
-		seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
-		seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
-		seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
-
+		print_session_info(s_file, fl);
 		if(fl->cctx) {
 			seq_printf(s_file,"\n=============== Channel Context ===============\n");
 			ctx = fl->cctx;
@@ -3130,6 +3135,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		goto err_name;
 	}
 	fl->sctx = sctx;
+	memcpy(fl->name, current->comm, TASK_COMM_LEN - 1);
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 	is_oispd = !strcmp(name, "oispd");
@@ -3413,6 +3419,148 @@ err_sharedbuf_fail:
 	return err;
 }
 
+/**
+ * Write formatted seq_file buffer content to fastrpc user
+ * log buffer.
+ *
+ * @param[in] log_buf : Pointer to the fastrpc_log_buf structure
+ * @param[in] s_file  : Pointer to seq_file containing formatted output
+ * @return None
+ */
+static void fastrpc_append_seq_file_to_log_buf(
+	struct fastrpc_log_buf *log_buf, struct seq_file *s_file)
+{
+	int len;
+
+	if (s_file->count < s_file->size) {
+		s_file->buf[s_file->count] = '\0';
+		len = s_file->count + 1;
+	} else {
+		s_file->buf[s_file->size - 1] = '\0';
+		len = s_file->size;
+	}
+
+	if (log_buf->offset + len < LOG_BUF_SIZE) {
+		memcpy(log_buf->buffer + log_buf->offset, s_file->buf, len);
+		log_buf->offset += len;
+	} else {
+		pr_warn("%s: Insufficient log buffer space (offset: %d, required: %d, available: %d)\n",
+		__func__, log_buf->offset, len, LOG_BUF_SIZE - log_buf->offset);
+	}
+}
+
+/**
+ * Collect and append detailed session-related information to a log buffer
+ *
+ * Logs session metadata, channel context, and invoke/interrupted context
+ * information for a given user session into the provided buffer. Each section
+ * is formatted using a seq_file and appended as a null-terminated string.
+ *
+ * param[in] log_buf : Pointer to the fastrpc_log_buf structure
+ * @param[in] s_file : Pointer to seq_file used for formatting output
+ * @param[in] fl     : Pointer to the fastrpc user session whose data is logged
+ * @param[in] session_num : Session number for identification
+ * @return None
+ */
+static void fastrpc_log_session_info(struct fastrpc_log_buf *log_buf,
+	struct seq_file *s_file, struct fastrpc_user *fl, int session_num)
+{
+	struct fastrpc_invoke_ctx *ictx;
+
+	s_file->count = 0;
+	seq_printf(s_file, "session_num : %d\n", session_num);
+	fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+
+	s_file->count = 0;
+	print_session_info(s_file, fl);
+	fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+
+	if (fl->sctx) {
+		s_file->count = 0;
+		print_sctx_info(s_file, fl->sctx);
+		fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+	}
+
+	spin_lock(&fl->lock);
+	list_for_each_entry(ictx, &fl->pending, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+	}
+
+	list_for_each_entry(ictx, &fl->interrupted, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+	}
+	spin_unlock(&fl->lock);
+}
+
+/**
+ * Log session information for all active users in the channel
+ *
+ * Collects and appends detailed session and context information from all
+ * active user sessions in the channel to the calling user's log buffer.
+ *
+ * @param[in] user : Pointer to the fastrpc user session initiating the log
+ * @return None
+ */
+static void fastrpc_store_sessions_info(struct fastrpc_user *user)
+{
+	struct seq_file *s_file = NULL;
+	int err = 0, session_num = 0;
+	struct fastrpc_user *fl;
+	unsigned long irq_flags = 0;
+	struct fastrpc_channel_ctx *cctx;
+
+	if (atomic_cmpxchg(&user->log_buf.state, LOG_BUF_STATE_DEFAULT,
+		LOG_BUF_STATE_UPDATING) != LOG_BUF_STATE_DEFAULT)
+		return;
+
+	if (!user->log_buf.buffer)
+		return;
+
+	memset(user->log_buf.buffer, 0, LOG_BUF_SIZE);
+	user->log_buf.offset = 0;
+	user->log_buf.pid = current->pid;
+	cctx = user->cctx;
+
+	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
+	if (!s_file) {
+		err = -ENOMEM;
+		goto bail;
+	}
+
+	s_file->buf = kzalloc(SESSION_BUF_SIZE, GFP_KERNEL);
+	if (!s_file->buf) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->size = SESSION_BUF_SIZE;
+
+	print_ctx_info(s_file, cctx);
+	fastrpc_append_seq_file_to_log_buf(&user->log_buf, s_file);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	list_for_each_entry(fl, &cctx->users, user) {
+		session_num++;
+		fastrpc_log_session_info(&user->log_buf, s_file, fl, session_num);
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
+
+bail:
+	if (s_file) {
+		kfree(s_file->buf);
+		kfree(s_file);
+	}
+	if (err) {
+		dev_err(user->cctx->dev, "%s failed with err 0x%x", __func__, err);
+		atomic_set(&user->log_buf.state, LOG_BUF_STATE_DEFAULT);
+	} else {
+		atomic_set(&user->log_buf.state, LOG_BUF_STATE_COMPLETED);
+	}
+}
+
 static int fastrpc_init_create_process(struct fastrpc_user *fl,
 					char __user *argp)
 {
@@ -3474,6 +3622,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 * comparing current PID with the one stored during device open.
 	 */
 	fl->tgid_app = current->tgid;
+	memcpy(fl->name, current->comm, TASK_COMM_LEN - 1);
 	if (fl->tgid_app != fl->tgid) {
 		fl->untrusted_process = true;
 		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
@@ -3741,6 +3890,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	if (fl->hdr_bufs) {
 		kfree(fl->hdr_bufs);
 		fl->hdr_bufs = NULL;
+	}
+
+	if (fl->log_buf.buffer) {
+		kfree(fl->log_buf.buffer);
+		fl->log_buf.buffer = NULL;
 	}
 
 	fastrpc_buf_list_free(fl, &fl->cached_bufs, true);
@@ -4105,6 +4259,12 @@ static int fastrpc_user_obj_create(struct file *filp,
 		list_add_tail(&fl->user, &cctx->users);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 
+		fl->log_buf.buffer = kzalloc(LOG_BUF_SIZE, GFP_KERNEL);
+		if (!fl->log_buf.buffer) {
+			err = -ENOMEM;
+			goto error;
+		}
+		atomic_set(&fl->log_buf.state, LOG_BUF_STATE_DEFAULT);
 	} else {
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;
@@ -4254,6 +4414,7 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 		return -EBUSY;
 	}
 	fl->sctx = sctx;
+	memcpy(fl->name, current->comm, TASK_COMM_LEN - 1);
 
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.
@@ -5585,6 +5746,40 @@ static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, struct fastrpc_inte
 	return err;
 }
 
+/**
+ * Retrieve kernel log data from ring buffer
+ *
+ * Copies available log entries from the ring buffer to the user-provided
+ * buffer in the ioctl payload.
+ *
+ * @param[in]  klog   : Pointer to ioctl kernel log structure
+ * @param[in]  fl   : Pointer to fastrpc user
+ *
+ * @return 0 on success, error code on failure
+ */
+static int fastrpc_retrieve_kernel_logs(struct fastrpc_ioctl_kernel_log
+		*klog, struct fastrpc_user *fl)
+{
+	int err = 0;
+
+	if ((atomic_read(&fl->log_buf.state) != LOG_BUF_STATE_COMPLETED) ||
+		(fl->log_buf.pid != current->pid))
+		return 0;
+
+	if (klog->buffer_size < fl->log_buf.offset) {
+		err = -EINVAL;
+		goto bail;
+	}
+
+	if (copy_to_user((void __user *)klog->buffer, fl->log_buf.buffer,
+		fl->log_buf.offset))
+		err = -EFAULT;
+
+bail:
+	atomic_set(&fl->log_buf.state, LOG_BUF_STATE_DEFAULT);
+	return err;
+}
+
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_enhanced_invoke inv2 ;
@@ -5597,6 +5792,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	struct fastrpc_internal_proc_timeout rpc = {0};
+	struct fastrpc_ioctl_kernel_log klog = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	bool legacy_domains = true;
@@ -5694,6 +5890,12 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			(void __user *)(uintptr_t)invoke.invparam, sizeof(recovery)))
 			return -EFAULT;
 		err = fastrpc_set_dsp_recovery_mode(fl, recovery);
+		break;
+	case FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG:
+		if (copy_from_user(&klog, (void __user *)(uintptr_t)invoke.invparam,
+				sizeof(klog)))
+			return -EFAULT;
+		err = fastrpc_retrieve_kernel_logs(&klog, fl);
 		break;
 	default:
 		err = -ENOTTY;
@@ -6410,6 +6612,9 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		err = -ENOTTY;
 		break;
 	}
+
+	if (process_init && (err == -EBUSY))
+		fastrpc_store_sessions_info(fl);
 
 	if (process_init && !err)
 		err = fastrpc_device_create(fl);
