@@ -124,3 +124,11 @@ def define_vm_modules(target, variant):
         allow_duplicate_filenames = False,
         mode_overrides = {"**/*": "644"},
     )
+
+def define_target_modules():
+    # Creates a ddk_headers that exposes the FastRPC UAPI header with public visibility
+    ddk_headers(
+        name = "frpc_uapi_headers",
+        hdrs = native.glob(["include/uapi/misc/fastrpc.h"]),
+        visibility = ["//visibility:public"]
+    )

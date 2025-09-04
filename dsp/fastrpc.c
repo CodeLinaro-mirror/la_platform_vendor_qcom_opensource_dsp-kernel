@@ -622,7 +622,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct timespec64 start_ts, end_ts;
 	int err = 0;
 
-	if (!size)
+	/* Check if the size is valid (non-zero and within integer range) */
+	if (!size || size > INT_MAX)
 		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
@@ -1837,6 +1838,22 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 				  PAGE_SHIFT;
 			pages[i].size = (pg_end - pg_start + 1) * PAGE_SIZE;
 			PERF_END);
+			/*
+			 * Check for page range overflow and validate page
+			 * range is not greater than map buffer range.
+			 * This prevents potential buffer overflow
+			 * and memory corruption that could be exploited.
+			 */
+			if (pages[i].addr > (ULLONG_MAX - pages[i].size) ||
+			   (pages[i].addr + pages[i].size) >
+					(ctx->maps[i]->phys + ctx->maps[i]->size)) {
+				err = -EFAULT;
+				dev_err(dev,
+					"Invalid buffer addr 0x%llx len 0x%llx IPA 0x%llx size 0x%llx fd %d\n",
+					ctx->args[i].ptr, len, ctx->maps[i]->phys,
+					ctx->maps[i]->size, ctx->maps[i]->fd);
+				goto bail;
+			}
 		} else {
 			PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_COPY),
 			if (ctx->olaps[oix].offset == 0) {
@@ -2698,13 +2715,14 @@ static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct
 		if (err) {
 			dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d\n",
 				__func__, buf->phys, buf->size, err);
+			BUG_ON(1);
 			return err;
 		}
 	}
 	return 0;
 }
 
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
 {
 	struct fastrpc_buf *buf, *b, *match;
 	unsigned long flags;
@@ -2722,14 +2740,12 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 		if (!match)
 			return 0;
 
-		if (is_pdr) {
-			err = fastrpc_remote_heap_unassign(cctx, match);
-			if (err) {
-				spin_lock_irqsave(&cctx->lock, flags);
-				list_add_tail(&match->node, &cctx->gmaps);
-				spin_unlock_irqrestore(&cctx->lock, flags);
-				return err;
-			}
+		err = fastrpc_remote_heap_unassign(cctx, match);
+		if (err) {
+			spin_lock_irqsave(&cctx->lock, flags);
+			list_add_tail(&match->node, &cctx->gmaps);
+			spin_unlock_irqrestore(&cctx->lock, flags);
+			return err;
 		}
 
 		__fastrpc_buf_free(match);
@@ -3145,7 +3161,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		 * Remove any previous mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
-		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
+		err = fastrpc_mmap_remove_ssr(fl->cctx);
 		if (err) {
 			pr_warn("%s: %s: failed to unmap remote heap (err %d)\n",
 				current->comm, __func__, err);
@@ -3602,8 +3618,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	}
 
 #ifdef CONFIG_DEBUG_FS
-	if (fl != NULL)
-		fastrpc_create_session_debugfs(fl);
+	fastrpc_create_session_debugfs(fl);
 #endif
 	/* remove buffer on success as no longer required */
 	if (fl->proc_init_sharedbuf) {
@@ -4412,7 +4427,7 @@ static int fastrpc_get_notif_response(
 	 */
 	if (legacy_domains) {
 		domain = fastrpc_lookup_domain_in_table(notif->domain, false);
-		if (domain->legacy)
+		if (domain && domain->legacy)
 			notif->domain = domain->legacy_id;
 	}
 
@@ -4493,9 +4508,6 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
 
-	if (!fl) {
-		return -EBADF;
-	}
 	if (!cp) {
 		return -EINVAL;
 	}
@@ -6399,13 +6411,8 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		break;
 	}
 
-	if (process_init && !err) {
+	if (process_init && !err)
 		err = fastrpc_device_create(fl);
-		if (err)
-			atomic_set(&fl->state, DEFAULT_PROC_STATE);
-		else
-			atomic_set(&fl->state, DSP_CREATE_COMPLETE);
-	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
@@ -6812,6 +6819,7 @@ static int fastrpc_device_create(struct fastrpc_user *fl)
 	frpc_dev->fl = fl;
 	frpc_dev->handle = fl->tgid_frpc;
 	fl->device = frpc_dev;
+	atomic_set(&fl->state, DSP_CREATE_COMPLETE);
 	return err;
 }
 
@@ -7064,9 +7072,18 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct seq_file *s_file = NULL;
 	struct fastrpc_dump_info *dinfo;
 	struct fastrpc_buf *buf, *b;
+	unsigned long flags;
+	struct list_head lgmaps_list;
 
-	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
+	INIT_LIST_HEAD(&lgmaps_list);
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
 		total_size += buf->size;
+		list_del(&buf->node);
+		list_add_tail(&buf->node, &lgmaps_list);
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
@@ -7085,12 +7102,11 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	pos += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 	offset += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 
-	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+	list_for_each_entry_safe(buf, b, &lgmaps_list, node) {
 		err = fastrpc_remote_heap_unassign(cctx, buf);
-		if (err) {
-			list_del(&buf->node);
+		list_del(&buf->node);
+		if (err)
 			continue;
-		}
 		if ((dump + total_size) - pos >= buf->size) {
 			memcpy(pos, buf->virt, buf->size);
 			populate_dump_metadata(&dinfo[iter], offset, buf->size,
@@ -7099,6 +7115,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			iter += 1;
 			offset += buf->size;
 		}
+		__fastrpc_buf_free(buf);
 	}
 	scm_done = true;
 	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
@@ -7142,11 +7159,12 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	dev_coredumpv(dev, dump, total_size, GFP_KERNEL);
 bail:
 	if (!scm_done) {
-		list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+		list_for_each_entry_safe(buf, b, &lgmaps_list, node) {
 			err = fastrpc_remote_heap_unassign(cctx, buf);
-			if (err) {
-				list_del(&buf->node);
-			}
+			list_del(&buf->node);
+			if (err)
+				continue;
+			__fastrpc_buf_free(buf);
 		}
 	}
 	if (err)
@@ -7383,6 +7401,9 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		dev_err(dev, "32-bit DMA enable failed\n");
 		return rc;
 	}
+	/* Set larger segment size to allow smmu to map > 4GB */
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
 #ifdef CONFIG_DEBUG_FS
 	if (debugfs_root && !g_frpc.debugfs_global_file) {
 		debugfs_global_file = debugfs_create_file("global", 0644,
