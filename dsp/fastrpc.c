@@ -3581,7 +3581,8 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	int err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
 	void *file = NULL;
-	struct {
+	
+      struct {
 		int pgid;
 		u32 namelen;
 		u32 filelen;
