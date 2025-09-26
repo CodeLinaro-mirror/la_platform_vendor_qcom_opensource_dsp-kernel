@@ -65,4 +65,8 @@ define_modules("x1e80100", "perf")
 
 define_modules("x1e80100", "consolidate")
 
+define_modules("alor-le", "debug-defconfig")
+
+define_modules("alor-le", "defconfig")
+
 define_target_modules()
