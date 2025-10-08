@@ -3470,6 +3470,8 @@ static void fastrpc_append_seq_file_to_log_buf(
 static void fastrpc_log_session_info(struct fastrpc_log_buf *log_buf,
 	struct seq_file *s_file, struct fastrpc_user *fl, int session_num)
 {
+	struct fastrpc_invoke_ctx *ictx;
+
 	s_file->count = 0;
 	seq_printf(s_file, "session_num : %d\n", session_num);
 	fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
@@ -3483,6 +3485,20 @@ static void fastrpc_log_session_info(struct fastrpc_log_buf *log_buf,
 		print_sctx_info(s_file, fl->sctx);
 		fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
 	}
+
+	spin_lock(&fl->lock);
+	list_for_each_entry(ictx, &fl->pending, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+	}
+
+	list_for_each_entry(ictx, &fl->interrupted, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		fastrpc_append_seq_file_to_log_buf(log_buf, s_file);
+	}
+	spin_unlock(&fl->lock);
 }
 
 /**
