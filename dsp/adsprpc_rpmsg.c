@@ -243,7 +243,9 @@ static struct rpmsg_driver fastrpc_rpmsg_client = {
 void fastrpc_rproc_trace_events(const char *name, const char *event,
 				const char *subevent)
 {
+#if IS_ENABLED(CONFIG_QCOM_RPROC_COMMON)
 	trace_rproc_qcom_event(name, event, subevent);
+#endif
 }
 
 inline void fastrpc_transport_session_init(int cid, char *subsys)
