@@ -69,4 +69,8 @@ define_modules("chora", "perf")
 
 define_modules("chora", "consolidate")
 
+define_modules("alor-le", "debug-defconfig")
+
+define_modules("alor-le", "defconfig")
+
 define_target_modules()
