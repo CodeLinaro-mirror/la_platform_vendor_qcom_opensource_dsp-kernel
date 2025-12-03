@@ -1735,8 +1735,10 @@ map_retry:
 
 	if (retain_iova_attr) {
 		err = fastrpc_map_reserve_iova(smmucb, map);
-		if (err)
+		if (err) {
+			mutex_unlock(&smmucb->map_mutex);
 			goto assign_err;
+		}
 	} else if (attr & FASTRPC_ATTR_SECUREMAP) {
 		map->phys = sg_phys(map->table->sgl);
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
