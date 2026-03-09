@@ -1201,8 +1201,8 @@ static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 			ctx->olaps[i].mstart = ctx->olaps[i].start;
 			ctx->olaps[i].offset = 0;
 			*last_buf_end = ctx->olaps[i].end;
-			*last_raix    = ctx->olaps[i].raix;
 		}
+		*last_raix = ctx->olaps[i].raix;
 	}
 	return 0;
 }
@@ -1226,6 +1226,7 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 	ctx->nbufs = REMOTE_SCALARS_INBUFS(sc) +
 		     REMOTE_SCALARS_OUTBUFS(sc);
 
+	ctx->sc = sc;
 	if (ctx->nscalars) {
 		ctx->maps = kcalloc(ctx->nscalars,
 				    sizeof(*ctx->maps), GFP_KERNEL);
@@ -1278,7 +1279,6 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 		ctx->perf->tid = ctx->fl->tgid_app;
 	}
 	ctx->handle = invoke->inv.handle;
-	ctx->sc = sc;
 	ctx->retval = -1;
 	ctx->pid = current->pid;
 	ctx->tgid = user->tgid_app;
