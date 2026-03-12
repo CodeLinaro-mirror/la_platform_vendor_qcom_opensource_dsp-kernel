@@ -132,6 +132,8 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_MDCTX_MANAGE = 9,
 	FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP = 10,
 	FASTRPC_INVOKE_SET_RPC_TIMEOUT = 11,
+	/* define to 32 to avoid conflict with new invoke type added */
+	FASTRPC_INVOKE_DSPSIGNAL_MC = 32,
 };
 
 struct fastrpc_init_create {
@@ -266,6 +268,8 @@ enum fastrpc_dspsignal_type {
 	FASTRPC_DSPSIGNAL_CREATE = 3,
 	FASTRPC_DSPSIGNAL_DESTROY = 4,
 	FASTRPC_DSPSIGNAL_CANCEL_WAIT = 5,
+	FASTRPC_DSPSIGNAL_SIGNAL_MC = 6,
+	FASTRPC_DSPSIGNAL_WAIT_MC = 7,
 };
 
 enum fastrpc_status_flags {
