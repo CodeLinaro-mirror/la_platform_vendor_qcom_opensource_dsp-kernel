@@ -1053,6 +1053,7 @@ struct fastrpc_user {
 	struct list_head mdctxs;
 
 	struct fastrpc_channel_ctx *cctx;
+	struct file *file;
 
 	/* Context bank(s) used for all regular buffer mappings */
 	struct fastrpc_pool_ctx *sctx;
@@ -1142,6 +1143,8 @@ struct fastrpc_user {
 	atomic_t state;
 	/* Timeout in ms */
 	uint32_t timeout;
+	struct kref refcount;
+	struct work_struct put_work;
 };
 
 struct fastrpc_ctrl_latency {
@@ -1271,5 +1274,30 @@ int fastrpc_sysfs_register_kset(void);
  * @return: None
  */
 void fastrpc_sysfs_deregister_kset(void);
+
+/*
+ * fastrpc_file_get - Take a reference on the fastrpc user object
+ *
+ * Increments the reference count for the specified fastrpc user object
+ * if it is non-zero, ensuring safe access.
+ *
+ * @fl: Pointer to the fastrpc_user structure.
+ *
+ * @return: 0 on success, or -ENOENT if the object is already being freed.
+ */
+int fastrpc_file_get(struct fastrpc_user *fl);
+
+/*
+ * fastrpc_file_put - Release reference to the fastrpc user object
+ *
+ * Decrements the reference count for the specified fastrpc user object.
+ * If the reference count drops to zero, the corresponding resources are
+ * released.
+ *
+ * @fl: Pointer to the fastrpc_user structure.
+ * @worker: If true, schedules the release callback in a worker thread
+ *          (safe from interrupt context); otherwise decrements directly.
+ */
+void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
 
 #endif /* __FASTRPC_SHARED_H__ */
