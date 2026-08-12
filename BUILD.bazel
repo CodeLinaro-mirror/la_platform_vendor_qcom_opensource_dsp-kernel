@@ -56,3 +56,7 @@ define_modules("bengal", "perf", "no")
 define_modules("bengal-le", "debug-defconfig", "no")
 
 define_modules("bengal-le", "defconfig", "no")
+
+define_modules("waipio", "consolidate", "no")
+
+define_modules("waipio", "perf", "no")
