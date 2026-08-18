@@ -5058,6 +5058,8 @@ bail:
 		kfree(mdctx->tgids_frpc);
 		kfree(mdctx->session_ids);
 		kfree(mdctx->domains);
+		kfree(mdctx->phy_ids);
+		kfree(mdctx->instance_ids);
 		kfree(mdctx);
 	}
 	mutex_unlock(gmut);
@@ -5102,6 +5104,8 @@ static int fastrpc_multidomain_ctx_cleanup(struct fastrpc_user *fl,
 	kfree(mdctx->tgids_frpc);
 	kfree(mdctx->session_ids);
 	kfree(mdctx->domains);
+	kfree(mdctx->phy_ids);
+	kfree(mdctx->instance_ids);
 	kfree(mdctx);
 bail:
 	mutex_unlock(gmut);
